@@ -1,0 +1,51 @@
+# Face Recognition Attendance System - Requirements
+# Install: pip install -r requirements.txt
+
+# --- CORE LIBRARIES ---
+numpy
+opencv-python>=4.8.0
+Pillow>=10.0.0
+deep-sort-realtime
+
+# --- FACE RECOGNITION ---
+# Note: Pre-compiled wheels for Windows to avoid C++ Build Tools requirement
+https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp39-cp39-win_amd64.whl ; sys_platform == 'win32' and python_version == '3.9'
+https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp310-cp310-win_amd64.whl ; sys_platform == 'win32' and python_version == '3.10'
+https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp311-cp311-win_amd64.whl ; sys_platform == 'win32' and python_version == '3.11'
+https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp312-cp312-win_amd64.whl ; sys_platform == 'win32' and python_version == '3.12'
+https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp313-cp313-win_amd64.whl ; sys_platform == 'win32' and python_version == '3.13'
+insightface>=0.7.3 ; sys_platform != 'win32' or (sys_platform == 'win32' and python_version < '3.9') or (sys_platform == 'win32' and python_version >= '3.14')
+onnxruntime-gpu>=1.16.0; sys_platform == 'win32' # Recommended for NVIDIA GPU
+onnxruntime>=1.16.0; sys_platform != 'win32'     # CPU fallback
+
+# --- TRACKING & UTILS ---
+supervision>=0.16.0
+
+
+
+requests>=2.31.0
+
+# --- DATABASE ---
+mysql-connector-python>=8.0.0
+
+# --- GUI ---
+PySide6>=6.5.0
+qtawesome>=1.2.0
+qt-material>=2.14.0
+# tkinter is built-in, no install needed
+
+# --- EXTRAS ---
+pyttsx3>=2.90        # Text-to-Speech
+reportlab>=4.0.0     # PDF Generation
+
+# --- API ---
+fastapi
+uvicorn
+sqlalchemy
+pydantic
+pymysql
+passlib[bcrypt]
+bcrypt
+python-jose[cryptography]
+pyinstaller
+

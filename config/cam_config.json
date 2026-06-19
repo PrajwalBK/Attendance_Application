@@ -1,0 +1,70 @@
+{
+    "rtsp_template": "rtsp://admin:Admin%40123@{ip}:554/ch{channel}/main",
+    "primary_source": "Channel 1",
+    "secondary_source": "Channel 2",
+    "num_channels": 16,
+    "auto_start_on_boot": false,
+    "active_cam_count": 8,
+    "cams": [
+        {
+            "name": "CAMERA 1",
+            "source": "Camera 1",
+            "role": "monitor",
+            "ip": "192.168.1.119",
+            "template": "rtsp://admin:Admin%40123@{ip}:554/ch{channel}/main"
+        },
+        {
+            "name": "CAMERA 2",
+            "source": "Webcam 0",
+            "role": "monitor",
+            "ip": "192.168.1.119",
+            "template": "rtsp://admin:Admin%40123@{ip}:554/ch{channel}/main"
+        },
+        {
+            "name": "CAMERA 3",
+            "source": "Camera 3",
+            "role": "monitor",
+            "ip": "192.168.1.119",
+            "template": "rtsp://admin:Admin%40123@{ip}:554/ch{channel}/main"
+        },
+        {
+            "name": "CAMERA 4",
+            "source": "Camera 4",
+            "role": "monitor",
+            "ip": "192.168.1.119",
+            "template": "rtsp://admin:Admin%40123@{ip}:554/ch{channel}/main"
+        },
+        {
+            "name": "CAMERA 5",
+            "source": "Camera 5",
+            "role": "monitor",
+            "ip": "192.168.1.119",
+            "template": "rtsp://admin:Admin%40123@{ip}:554/ch{channel}/main"
+        },
+        {
+            "name": "CAMERA 6",
+            "source": "Camera 6",
+            "role": "monitor",
+            "ip": "192.168.1.119",
+            "template": "rtsp://admin:Admin%40123@{ip}:554/ch{channel}/main"
+        },
+        {
+            "name": "CAMERA 7",
+            "source": "Camera 7",
+            "role": "monitor",
+            "ip": "192.168.1.119",
+            "template": "rtsp://admin:Admin%40123@{ip}:554/ch{channel}/main"
+        },
+        {
+            "name": "CAMERA 8",
+            "source": "Camera 8",
+            "role": "monitor",
+            "ip": "192.168.1.119",
+            "template": "rtsp://admin:Admin%40123@{ip}:554/ch{channel}/main"
+        }
+    ],
+    "discovered_ips": [
+        "192.168.1.119"
+    ],
+    "brand": "AUTO-DETECT (Recommended)"
+}

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Attendance AI System
+Comment=Launch the Face Recognition Attendance System
+# The Exec path needs to be replaced with the actual path on the Pi
+# We use 'bash path/to/script' here so it works even if the file isn't marked executable!
+Exec=bash /home/prosper123/desktop_application-v1/run_attendance.sh
+# Optional: Set an icon path
+Icon=/home/prosper123/desktop_application-v1/ui/prosper1.png
+Terminal=true
+Type=Application
+Categories=Utility;
+StartupNotify=true
