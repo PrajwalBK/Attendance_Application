@@ -9,6 +9,7 @@ os.environ["ORT_ARENA_EXTEND_STRATEGY"] = "kSameAsRequested"
 
 # AGGRESSIVE RTSP TIMEOUT: 5 seconds (in microseconds)
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|timeout;5000000|stimeout;5000000"
+os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 
 import sys
 import threading

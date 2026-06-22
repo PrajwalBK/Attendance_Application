@@ -411,7 +411,7 @@ class BackendController(QThread):
                 host = parts[0]
                 port = int(parts[1]) if len(parts) > 1 else 554
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(2.0)
+                sock.settimeout(0.5)
                 if sock.connect_ex((host, port)) == 0:
                     is_reachable = True
                 sock.close()
@@ -956,8 +956,9 @@ class BackendController(QThread):
             pending_dir = "data/pending_snapshots"
             os.makedirs(pending_dir, exist_ok=True)
             
+            role = self.cam_roles[cam_index]
             ts = int(time.time() * 1000)
-            filename = f"cam_{cam_index}_{ts}.jpg"
+            filename = f"cam_{cam_index}_{role}_{ts}.jpg"
             filepath = os.path.join(pending_dir, filename)
             
             self._log_debug(f"Attempting to write snapshot: {filename}")
@@ -995,7 +996,7 @@ class BackendController(QThread):
                 return
                 
             # Clean up the queued_snapshots dictionary for files that no longer exist
-            self.queued_snapshots = {p: mt for p, mt in self.queued_snapshots.items() if os.path.exists(p)}
+            self.queued_snapshots = {p: info for p, info in self.queued_snapshots.items() if os.path.exists(p)}
             
             valid_exts = ('.jpg', '.jpeg', '.png')
             for fname in os.listdir(pending_dir):
@@ -1011,9 +1012,22 @@ class BackendController(QThread):
                 except Exception:
                     continue
                 
-                # Skip if already queued and modification time is unchanged
-                if abs_path in self.queued_snapshots and self.queued_snapshots[abs_path] == mtime:
-                    continue
+                # Skip if already queued, modification time is unchanged, AND target worker is still alive
+                if abs_path in self.queued_snapshots:
+                    entry = self.queued_snapshots[abs_path]
+                    saved_mtime, queued_worker_idx = entry if isinstance(entry, tuple) else (entry, None)
+                    
+                    if saved_mtime == mtime:
+                        # Determine if the target worker is still alive
+                        target_idx = queued_worker_idx
+                        if target_idx is None:
+                            match = re.search(r'cam_(\d+)_', fname)
+                            target_idx = int(match.group(1)) if match else 0
+                            
+                        if 0 <= target_idx < MAX_CAMS:
+                            w = self.workers[target_idx]
+                            if w and w.is_alive():
+                                continue
                     
                 # Determine camera index (defaults to 0, which is 'entrance'/IN)
                 cam_index = 0
@@ -1026,8 +1040,20 @@ class BackendController(QThread):
                     if worker and worker.is_alive():
                         # Queue snapshot to the specific worker process
                         self.task_queues[cam_index].put_nowait(filepath)
-                        self.queued_snapshots[abs_path] = mtime
+                        self.queued_snapshots[abs_path] = (mtime, cam_index)
                         self._log_debug(f"Queued snapshot to Worker {cam_index + 1}: {fname}")
+                    else:
+                        # Find ANY active worker to process the pending snapshot
+                        active_worker_index = -1
+                        for idx, w in enumerate(self.workers):
+                            if w and w.is_alive():
+                                active_worker_index = idx
+                                break
+                        
+                        if active_worker_index != -1:
+                            self.task_queues[active_worker_index].put_nowait(filepath)
+                            self.queued_snapshots[abs_path] = (mtime, active_worker_index)
+                            self._log_debug(f"Queued snapshot for CAM_{cam_index+1} (Monitor/Offline) to active Worker {active_worker_index + 1}: {fname}")
         except Exception as e:
             self._log_debug(f"Error scanning pending snapshots: {e}")
 
@@ -1167,12 +1193,15 @@ class BackendController(QThread):
         if i >= self.active_cam_count:
             return
             
+        role = self.cam_roles[i]
+        if str(role).lower() == 'monitor':
+            return
+            
         # Only start if worker slot is empty or not alive
         if self.workers[i] is None or not self.workers[i].is_alive():
             if not hasattr(self, 'init_lock') or self.init_lock is None:
                 self.init_lock = multiprocessing.Lock()
                 
-            role = self.cam_roles[i]
             event_type = 'IN' if role == 'entrance' else ('OUT' if role == 'exit' else None)
             
             self.workers[i] = AttendanceWorker(
@@ -1193,11 +1222,13 @@ class BackendController(QThread):
         try:
             self.worker_signals.status_updated.emit("Starting AI (Staggered Startup)...")
 
-            # [FULL-FORCE] Always ensure all active slots have an active worker
+            # [FULL-FORCE] Always ensure all active slots have an active worker (excluding monitor cams)
             for i in range(self.active_cam_count):
+                role = self.cam_roles[i]
+                if str(role).lower() == 'monitor':
+                    continue
                 # Only start if worker slot is empty or the process has died
                 if self.workers[i] is None or not self.workers[i].is_alive():
-                    role = self.cam_roles[i]
                     event_type = 'IN' if role == 'entrance' else ('OUT' if role == 'exit' else None)
                     
                     self.workers[i] = AttendanceWorker(
@@ -1272,14 +1303,38 @@ class BackendController(QThread):
             except Exception as e:
                 print(f"[BACKEND] Error saving config role: {e}")
 
-            # If AI is running, update the corresponding worker's behavior
-            if self.workers[i]:
-                event_type = 'IN' if role == 'entrance' else ('OUT' if role == 'exit' else None)
-                # MUST inform the worker process
-                if self.task_queues[i]:
+            # Stop worker if role changed to MONITOR
+            if str(role).lower() == 'monitor':
+                if self.workers[i]:
                     try:
-                        self.task_queues[i].put({'type': 'update_role', 'event_type': event_type})
+                        self.workers[i].stop()
+                        if self.workers[i].is_alive():
+                            self.workers[i].join(timeout=1.0)
+                            if self.workers[i].is_alive():
+                                self.workers[i].terminate()
                     except: pass
+                    self.workers[i] = None
+                    print(f"[BACKEND] Stopped AI Worker {i+1} because role was changed to MONITOR.")
+                    
+                    # Clear queued snapshots memory for this camera so they can be re-queued to active workers
+                    try:
+                        import os
+                        self.queued_snapshots = {
+                            p: info for p, info in self.queued_snapshots.items()
+                            if not os.path.basename(p).startswith(f"cam_{i}_")
+                        }
+                    except: pass
+            else:
+                # If changed to entrance/exit, ensure worker is running if detection is enabled
+                if self.is_detection_enabled:
+                    self._start_single_worker(i)
+                elif self.workers[i]:
+                    # Update active worker's role if it is already running
+                    event_type = 'IN' if role == 'entrance' else ('OUT' if role == 'exit' else None)
+                    if self.task_queues[i]:
+                        try:
+                            self.task_queues[i].put({'type': 'update_role', 'event_type': event_type})
+                        except: pass
                 
     def swap_camera_source(self, i, source_text):
         """Stop the existing camera in slot `i` and immediately start the new requested source."""

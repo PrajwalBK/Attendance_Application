@@ -58,8 +58,8 @@ class PersonReID:
         person_id, name, sim = reid.identify(frame, body_bbox)
     """
 
-    def __init__(self, model_path: str, similarity_threshold: float = 0.72,
-                 execution_providers=None, temporal_window: float = 300.0):
+    def __init__(self, model_path: str, similarity_threshold: float = 0.82,
+                 execution_providers=None, temporal_window: float = 180.0):
         self._model_path         = model_path
         self.similarity_threshold = similarity_threshold
         self._providers           = execution_providers or ["CPUExecutionProvider"]
@@ -77,12 +77,26 @@ class PersonReID:
             return True
 
         if not os.path.exists(self._model_path):
-            print(
-                f"\n[ReID] ⚠  OSNet model not found at:\n"
-                f"    {self._model_path}\n"
-                f"    ReID is disabled. Contact your system administrator.\n"
-            )
-            return False
+            # Check if fallback model exists first before attempting download/generation
+            fallback_name = "osnet_x1_0.onnx" if "ibn" in self._model_path else "osnet_ibn_x1_0.onnx"
+            fallback_path = os.path.join(os.path.dirname(self._model_path), fallback_name)
+            if os.path.exists(fallback_path):
+                print(f"[ReID] OSNet model {self._model_path} missing. Falling back to existing model: {fallback_path}")
+                self._model_path = fallback_path
+            else:
+                # Attempt to download/generate the model automatically
+                if not self._download_model():
+                    # FALLBACK: Try to look for any other OSNet ONNX model in the same directory (e.g. osnet_x1_0.onnx)
+                    if os.path.exists(fallback_path):
+                        print(f"\n[ReID] OSNet model {self._model_path} could not be obtained. Falling back to existing model: {fallback_path}")
+                        self._model_path = fallback_path
+                    else:
+                        print(
+                            f"\n[ReID] ⚠  OSNet model not found at:\n"
+                            f"    {self._model_path}\n"
+                            f"    ReID is disabled. Contact your system administrator.\n"
+                        )
+                        return False
 
         try:
             import onnxruntime as ort
@@ -90,7 +104,7 @@ class PersonReID:
             self._input_name  = self._session.get_inputs()[0].name
             self._output_name = self._session.get_outputs()[0].name
             logger.info(f"[ReID] OSNet loaded — {self._model_path}")
-            print("[ReID] OSNet Re-ID model loaded successfully")
+            print(f"[ReID] OSNet Re-ID model loaded successfully from: {self._model_path}")
             return True
         except Exception as e:
             logger.error(f"[ReID] Failed to load OSNet: {e}")
@@ -116,6 +130,8 @@ class PersonReID:
             pass  # torchreid not installed, try installing
         except Exception as e:
             logger.warning(f"[ReID] torchreid export failed: {e}")
+            import traceback
+            traceback.print_exc()
 
         # ── Strategy 2: pip-install torchreid then export ─────────────────────
         try:
@@ -129,6 +145,8 @@ class PersonReID:
             return self._export_osnet_onnx()
         except Exception as e:
             logger.error(f"[ReID] Auto-install failed: {e}")
+            import traceback
+            traceback.print_exc()
 
         # ── Strategy 3: Manual instructions ───────────────────────────────────
         print(
@@ -148,14 +166,43 @@ class PersonReID:
         return False
 
     def _export_osnet_onnx(self) -> bool:
-        """Export OSNet x1.0 to ONNX using torchreid. Returns True on success."""
+        """Export OSNet model to ONNX using torchreid.
+
+        CRITICAL: torchreid's `pretrained=True` flag only loads ImageNet
+        classification weights — NOT person-ReID weights. Using that flag
+        alone produces a model that extracts generic visual features
+        (clothing colour, background, lighting) rather than discriminative
+        person-identity features. This is why different people were
+        matching at near-identical similarity scores (~0.72-0.79) in
+        testing — the embeddings were not person-discriminative at all.
+
+        The fix: explicitly download and load the MSMT17-trained ReID
+        checkpoint, which contains weights actually trained to distinguish
+        between different people's appearance.
+        """
         import torchreid   # noqa: F401  (raises ImportError if not installed)
         import torch
 
-        print("[ReID] Exporting OSNet x1.0 → ONNX (one-time, ~10 s) …")
+        # Extract model name from filename (e.g. osnet_ibn_x1_0 or osnet_x1_0)
+        base_name = os.path.splitext(os.path.basename(self._model_path))[0]
+
+        print(f"[ReID] Building {base_name} with MSMT17 ReID weights …")
+
+        # Build architecture WITHOUT ImageNet pretrained weights —
+        # we will load the correct ReID checkpoint instead.
         model = torchreid.models.build_model(
-            name="osnet_x1_0", num_classes=1000, pretrained=True
+            name=base_name,
+            num_classes=4101,        # MSMT17 has 4101 training identities
+            pretrained=False,        # do NOT load generic ImageNet weights
+            loss="softmax",
         )
+
+        # Download + load the actual person-ReID-trained checkpoint.
+        # This is the file that makes embeddings discriminative between people.
+        reid_checkpoint_path = self._download_reid_checkpoint()
+        torchreid.utils.load_pretrained_weights(model, reid_checkpoint_path)
+        print("[ReID] Loaded MSMT17 ReID-trained weights (not ImageNet).")
+
         model.eval()
 
         dummy = torch.randn(1, 3, _OSNET_INPUT_H, _OSNET_INPUT_W)
@@ -168,6 +215,62 @@ class PersonReID:
         )
         print(f"[ReID] OSNet ONNX saved → {self._model_path}")
         return True
+
+    def _download_reid_checkpoint(self) -> str:
+        """
+        Download the actual OSNet MSMT17 ReID-trained checkpoint (.pth.tar or .pt).
+        This is different from ImageNet pretraining — it's the file that
+        was trained specifically to distinguish between ~4100 different
+        people's appearance.
+        """
+        base_name = os.path.splitext(os.path.basename(self._model_path))[0]
+        checkpoint_dir = os.path.join(os.path.dirname(self._model_path), "checkpoints")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # Configure download parameters based on model name
+        if "ibn" in base_name:
+            checkpoint_file = "osnet_ibn_x1_0_msmt17.pth.tar"
+            drive_id = "1q3Sj2ii34NlfxA4LvmHdWO_75NDRmECJ"
+        else:
+            checkpoint_file = "osnet_x1_0_msmt17.pth.tar"
+            drive_id = "1IkqkHNQ9SfaeCbY8C8w8GP8L3HRtv4D6"
+            
+        checkpoint_path = os.path.join(checkpoint_dir, checkpoint_file)
+
+        if os.path.exists(checkpoint_path):
+            return checkpoint_path
+
+        url = f"https://drive.google.com/uc?id={drive_id}"
+        print(f"[ReID] Downloading {base_name} MSMT17 checkpoint (~10MB) …")
+        try:
+            import gdown
+        except ImportError:
+            import subprocess, sys
+            print("[ReID] Installing gdown (one-time) …")
+            try:
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", "gdown",
+                     "--quiet", "--no-warn-script-location"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                import gdown
+            except Exception as e:
+                raise RuntimeError(
+                    f"gdown is required to fetch the ReID checkpoint and auto-install failed: {e}. "
+                    "Run: pip install gdown\n"
+                    f"Or manually download from Google Drive (ID: {drive_id}) "
+                    f"and place it at: {checkpoint_path}"
+                )
+        
+        try:
+            gdown.download(url, checkpoint_path, quiet=False)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to download checkpoint using gdown: {e}. "
+                f"Or manually download from Google Drive (ID: {drive_id}) "
+                f"and place it at: {checkpoint_path}"
+            )
+        return checkpoint_path
 
 
     # ── Preprocessing ──────────────────────────────────────────────────────────
@@ -210,13 +313,13 @@ class PersonReID:
             # If the box is likely a face box (aspect ratio close to 1), extrapolate to body
             if box_w > 0 and (box_h / box_w) < 1.6:
                 cx = (x1 + x2) // 2
-                # Extrapolate body box:
-                # Height of body is roughly 7.5x head height
-                # Width of body is roughly 3x head width (1.5x on each side of center)
-                ext_y1 = max(0, int(y1 - 0.2 * box_h))
-                ext_y2 = min(h, int(y1 + 7.5 * box_h))
-                ext_x1 = max(0, int(cx - 1.5 * box_w))
-                ext_x2 = min(w, int(cx + 1.5 * box_w))
+                # Body proportions, tuned for a head-to-shoulder camera angle
+                # (was 7.5x/3x which over-extends on angled corridor cameras —
+                # this pulled in background/floor and diluted the embedding)
+                ext_y1 = max(0, int(y1 - 0.15 * box_h))
+                ext_y2 = min(h, int(y1 + 5.5 * box_h))     # was 7.5x — too tall
+                ext_x1 = max(0, int(cx - 1.3 * box_w))     # was 1.5x — too wide
+                ext_x2 = min(w, int(cx + 1.3 * box_w))
                 crop = frame[ext_y1:ext_y2, ext_x1:ext_x2]
             else:
                 x1 = max(0, x1); y1 = max(0, y1)
@@ -224,6 +327,13 @@ class PersonReID:
                 crop = frame[y1:y2, x1:x2]
 
             if crop.size == 0 or crop.shape[0] < 32 or crop.shape[1] < 16:
+                return None
+
+            # Quality gate — reject crops that are too blurry to produce a
+            # reliable embedding (this was missing entirely before, allowing
+            # bad reference embeddings to poison the gallery for the rest of
+            # the day)
+            if not self._is_crop_quality_ok(crop):
                 return None
 
             tensor = self._preprocess(crop)
@@ -362,6 +472,26 @@ class PersonReID:
         return None, None, float(best_sim)
 
     # ── Utilities ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _is_crop_quality_ok(crop: np.ndarray, blur_threshold: float = 60.0) -> bool:
+        """
+        Reject crops that are too blurry (motion blur, out of focus) to
+        produce a discriminative embedding. Uses Laplacian variance —
+        a standard, cheap blur metric (~0.3ms on a small crop).
+
+        Without this check, a single blurry frame can register a bad
+        reference embedding that then causes false matches with other
+        people for the rest of the day (this was happening — see the
+        near-identical 0.72-0.79 similarity scores across different
+        people in the logs).
+        """
+        try:
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            variance = cv2.Laplacian(gray, cv2.CV_64F).var()
+            return variance >= blur_threshold
+        except Exception:
+            return True  # don't block on a metric failure
 
     @staticmethod
     def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:

@@ -9,6 +9,7 @@ os.environ["ORT_ARENA_EXTEND_STRATEGY"] = "kSameAsRequested"
 
 # AGGRESSIVE RTSP TIMEOUT: 5 seconds (in microseconds)
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|timeout;5000000|stimeout;5000000"
+os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 
 import multiprocessing
 import cv2
@@ -530,7 +531,11 @@ class AttendanceWorker(multiprocessing.Process):
                             
                             # Try ReID fallback if face is not recognized
                             if not pid or pid == 'UNKNOWN':
-                                if self.reid is not None and self.reid.get_registered_count() > 0:
+                                if self.reid is None:
+                                    self._log_debug("[ReID] Skipping ReID fallback (ReID is disabled or failed to initialize).")
+                                elif self.reid.get_registered_count() == 0:
+                                    self._log_debug("[ReID] Skipping ReID fallback (Dynamic ReID gallery is empty. Face must be recognized first to enroll).")
+                                else:
                                     reid_id, reid_name, reid_sim = self.reid.identify(frame, box, timestamp=capture_ts)
                                     if reid_id:
                                         person['person_id'] = reid_id
@@ -706,11 +711,12 @@ class AttendanceWorker(multiprocessing.Process):
         filename = os.path.basename(filepath)
         self._log_debug(f"Processing snapshot: {filename}")
         
-        # 1. Parse timestamp from filename
-        # Expected format: cam_{cam_index}_{timestamp}.jpg
+        # 1. Parse timestamp and camera index from filename
         capture_ts = time.time()
+        cam_index = self.assigned_cam_index
         try:
             import re
+            # Extract timestamp
             m = re.search(r'_(\d+)\.', filename)
             if m:
                 raw_ts = float(m.group(1))
@@ -718,8 +724,41 @@ class AttendanceWorker(multiprocessing.Process):
                     capture_ts = raw_ts / 1000.0
                 else:
                     capture_ts = raw_ts
+            
+            # Extract camera index
+            cam_match = re.search(r'cam_(\d+)_', filename)
+            if cam_match:
+                cam_index = int(cam_match.group(1))
         except Exception as e:
-            self._log_debug(f"Snapshot timestamp parse error: {e}")
+            self._log_debug(f"Snapshot parse error: {e}")
+            
+        # Resolve event_type dynamically based on filename prefix first, then configuration, then fallback
+        event_type = None
+        try:
+            role_match = re.search(r'cam_\d+_([a-zA-Z]+)_', filename)
+            if role_match:
+                r_str = role_match.group(1).lower()
+                if r_str in ('entrance', 'in'):
+                    event_type = 'in'
+                elif r_str in ('exit', 'out'):
+                    event_type = 'out'
+                elif r_str in ('monitor', 'none'):
+                    event_type = 'monitor'
+        except: pass
+
+        if not event_type:
+            # Look up camera config for cam_index
+            try:
+                from config.cam_config_manager import CamConfigManager
+                cams_list = CamConfigManager.load_config().get('cams', [])
+                if cam_index < len(cams_list):
+                    role = cams_list[cam_index].get('role', 'monitor').lower()
+                    event_type = 'in' if role == 'entrance' else ('out' if role == 'exit' else 'monitor')
+            except: pass
+
+        if not event_type:
+            # Final fallback to worker's own event type
+            event_type = self.event_type.lower() if self.event_type else 'monitor'
             
         # 2. Read image
         frame = cv2.imread(filepath)
@@ -742,8 +781,8 @@ class AttendanceWorker(multiprocessing.Process):
                 resized_frame = frame
                 scale = 1.0
 
-            # Stage 2: Heavy Recognition (Direct InsightFace — V5 pipeline, bypass detect_faces)
-            faces = self.face_handler.app.get(resized_frame)
+            # Stage 2: Heavy Recognition (Using configured face detection backend, e.g. YOLOv8)
+            faces = self.face_handler.detect_faces(resized_frame)
             
             # Scale coordinates back
             if scale != 1.0:
@@ -765,7 +804,11 @@ class AttendanceWorker(multiprocessing.Process):
                     
                     # Try ReID fallback if face is not recognized
                     if not pid or pid == 'UNKNOWN':
-                        if self.reid is not None and self.reid.get_registered_count() > 0:
+                        if self.reid is None:
+                            self._log_debug("[ReID] Skipping ReID fallback (ReID is disabled or failed to initialize).")
+                        elif self.reid.get_registered_count() == 0:
+                            self._log_debug("[ReID] Skipping ReID fallback (Dynamic ReID gallery is empty. Face must be recognized first to enroll).")
+                        else:
                             reid_id, reid_name, reid_sim = self.reid.identify(frame, box, timestamp=capture_ts)
                             if reid_id:
                                 person['person_id'] = reid_id
@@ -783,7 +826,7 @@ class AttendanceWorker(multiprocessing.Process):
                             self._autosave_reid_cache()
                     
                     # Update DB and generate snapshot
-                    success, snapshot_path = self.handle_attendance(person, frame, capture_ts, self.event_type.lower() if self.event_type else 'monitor')
+                    success, snapshot_path = self.handle_attendance(person, frame, capture_ts, event_type)
                     if success is False:
                         db_operation_failed = True
                         
@@ -791,7 +834,7 @@ class AttendanceWorker(multiprocessing.Process):
                         name = person.get('person_name') or 'UNKNOWN'
                         self.result_queue.put({
                             'type': 'match',
-                            'event_type': self.event_type.upper() if self.event_type else 'MONITOR',
+                            'event_type': event_type.upper(),
                             'id': pid or 'UNKNOWN',
                             'name': name,
                             'sim': sim,
@@ -804,7 +847,13 @@ class AttendanceWorker(multiprocessing.Process):
                         })
             else:
                 self._log_debug(f"Snapshot {filename} contained no faces. Checking for bodies...")
-                if self.reid is not None and self.reid.get_registered_count() > 0:
+                if self.reid is None:
+                    self._log_debug("[ReID] Skipping ReID body check (ReID is disabled or failed to initialize).")
+                    self._log_debug(f"Snapshot {filename} contained no faces (Triage false positive) and ReID is inactive/empty.")
+                elif self.reid.get_registered_count() == 0:
+                    self._log_debug("[ReID] Skipping ReID body check (Dynamic ReID gallery is empty. Face must be recognized first to enroll).")
+                    self._log_debug(f"Snapshot {filename} contained no faces (Triage false positive) and ReID is inactive/empty.")
+                else:
                     bodies = self.reid.detect_bodies(frame)
                     self._log_debug(f"Detected {len(bodies)} bodies in snapshot.")
                     for body_box in bodies:
@@ -820,14 +869,14 @@ class AttendanceWorker(multiprocessing.Process):
                             }
                             self._log_debug(f"[ReID] Snapshot body matched: {reid_name} ({reid_id}) | Sim: {reid_sim:.2f}")
                             
-                            success, snapshot_path = self.handle_attendance(person, frame, capture_ts, self.event_type.lower() if self.event_type else 'monitor')
+                            success, snapshot_path = self.handle_attendance(person, frame, capture_ts, event_type)
                             if success is False:
                                 db_operation_failed = True
                                 
                             if self.result_queue:
                                 self.result_queue.put({
                                     'type': 'match',
-                                    'event_type': self.event_type.upper() if self.event_type else 'MONITOR',
+                                    'event_type': event_type.upper(),
                                     'id': reid_id,
                                     'name': reid_name,
                                     'sim': reid_sim,
@@ -838,8 +887,6 @@ class AttendanceWorker(multiprocessing.Process):
                                     'is_masked': False,
                                     'recognition_method': 'body_reid'
                                 })
-                else:
-                    self._log_debug(f"Snapshot {filename} contained no faces (Triage false positive) and ReID is inactive/empty.")
         except Exception as e:
             self._log_debug(f"Error processing snapshot: {e}")
             import traceback
@@ -863,6 +910,11 @@ class AttendanceWorker(multiprocessing.Process):
         name = person['person_name']
         sim = person['similarity']
         
+        # [NEW] Strictly skip all DB logging and snapshot generation for 'monitor' roles!
+        if event_type == 'monitor' or event_type is None or str(event_type).lower() == 'none':
+            self._log_debug(f"[MONITOR MODE] Detected {name or 'Unknown'} (Sim: {sim:.2f}) on monitor camera. Skipping database log & snapshot saving.")
+            return True, None
+            
         if not pid: 
             self._log_debug(f"Face detected but Unknown (Sim: {sim:.2f})")
             # Don't return early! Proceed to snapshot saving section.
@@ -922,7 +974,20 @@ class AttendanceWorker(multiprocessing.Process):
             threshold = config.get('similarity_threshold', 0.4)
             
             snapshot_path = None
-            if sim >= threshold:
+            rec_method = person.get('recognition_method', '')
+            # Use the appropriate threshold based on recognition method:
+            # - Masked methods (upper_face, mask_face, mask_face_std) use the lower masked threshold
+            # - Body ReID has its own threshold
+            # - Standard face uses the default similarity threshold
+            if rec_method in ('upper_face', 'mask_face', 'mask_face_std'):
+                from config.config import MASKED_SIMILARITY_THRESHOLD
+                save_threshold = MASKED_SIMILARITY_THRESHOLD
+            elif rec_method == 'body_reid':
+                from config.config import REID_SIMILARITY_THRESHOLD
+                save_threshold = REID_SIMILARITY_THRESHOLD
+            else:
+                save_threshold = threshold
+            if sim >= save_threshold:
                 category = event_type.lower() # 'in' or 'out'
                 if not pid or pid == 'UNKNOWN':
                     category = 'unknown'

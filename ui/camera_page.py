@@ -278,7 +278,7 @@ class CameraPage(QWidget):
                     qt_img = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
                     scaled = QPixmap.fromImage(qt_img).scaled(
                         widget.video_label.width(), widget.video_label.height(),
-                        Qt.KeepAspectRatio, Qt.SmoothTransformation
+                        Qt.KeepAspectRatio, Qt.FastTransformation
                     )
                     widget.video_label.setPixmap(scaled)
                 else:

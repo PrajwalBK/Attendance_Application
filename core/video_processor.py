@@ -197,9 +197,11 @@ class VideoProcessor:
                             face_crop = frame[y1:y2, x1:x2]
                             
                             if face_crop.size > 0:
-                                emb, _ = self.face_handler.extract_face_encoding(face_crop)
+                                emb, kps = self.face_handler.extract_face_details_from_crop(face_crop)
                                 if emb is not None:
                                     best_face.embedding = emb
+                                if kps is not None:
+                                    best_face.kps = kps + np.array([x1, y1])
 
                         # Check against the pickle file
                         if best_face.embedding is not None:

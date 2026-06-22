@@ -93,7 +93,7 @@ FACE_DETECTION_MODEL = 'buffalo_l'
 
 # --- MASK DETECTION SETTINGS ---
 MASK_DETECTION_ENABLED = True             # Master switch for mask-aware recognition
-MASKED_SIMILARITY_THRESHOLD = 0.35        # Lower threshold for masked face matching
+MASKED_SIMILARITY_THRESHOLD = 0.25        # Lower threshold for masked face matching (was 0.35; lowered to accept near-miss scores ~0.29)
 UPPER_FACE_CROP_RATIO = 0.55             # Crop top 55% of face bounding box for upper-face embedding
 MASK_NOSE_RATIO_THRESHOLD = 0.30          # Landmark heuristic: nose-to-eye ratio
 MASK_MOUTH_RATIO_THRESHOLD = 0.22         # Landmark heuristic: mouth drop ratio
@@ -101,16 +101,18 @@ MASK_MOUTH_SPREAD_THRESHOLD = 0.35        # Landmark heuristic: mouth width rati
 
 # --- PERSON RE-ID SETTINGS (OSNet body-appearance fallback) ---
 REID_ENABLED              = True          # Master switch — False disables all ReID
-REID_MODEL_PATH           = os.path.join(ASSET_DIR, 'data', 'models', 'osnet_x1_0.onnx')
+REID_MODEL_PATH           = os.path.join(ASSET_DIR, 'data', 'models', 'osnet_ibn_x1_0.onnx')
 REID_SIMILARITY_THRESHOLD = 0.72          # Cosine similarity required for a body match
 REID_CACHE_DIR            = os.path.join(BASE_DIR,  'data', 'reid_cache')  # Daily cache dir
 REID_AUTOSAVE_INTERVAL    = 60            # Seconds between auto-saves of the ReID gallery
-REID_TEMPORAL_WINDOW      = 300           # Keep body templates active for 300 seconds (5 minutes)
+REID_TEMPORAL_WINDOW      = 43200         # Keep body templates active for 43200 seconds (12 hours)
+                                            # (was 300s — too long given hospital staff often
+                                            # wear similar-coloured scrubs; a tighter window
+                                            # reduces the chance of matching the wrong person
+                                            # who happens to be dressed similarly)
 
 # Execution Providers (GPU/CPU)
 EXECUTION_PROVIDERS = [
-    'CUDAExecutionProvider',
-    'OpenVINOExecutionProvider',
     'CPUExecutionProvider'
 ]
 

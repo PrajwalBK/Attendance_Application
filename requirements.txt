@@ -2,7 +2,7 @@
 # Install: pip install -r requirements.txt
 
 # --- CORE LIBRARIES ---
-numpy
+numpy<2.0.0
 opencv-python>=4.8.0
 Pillow>=10.0.0
 deep-sort-realtime
@@ -15,8 +15,9 @@ https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp311-
 https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp312-cp312-win_amd64.whl ; sys_platform == 'win32' and python_version == '3.12'
 https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp313-cp313-win_amd64.whl ; sys_platform == 'win32' and python_version == '3.13'
 insightface>=0.7.3 ; sys_platform != 'win32' or (sys_platform == 'win32' and python_version < '3.9') or (sys_platform == 'win32' and python_version >= '3.14')
-onnxruntime-gpu>=1.16.0; sys_platform == 'win32' # Recommended for NVIDIA GPU
-onnxruntime>=1.16.0; sys_platform != 'win32'     # CPU fallback
+onnxruntime-openvino>=1.16.0; sys_platform == 'win32' # OpenVINO Execution Provider for CPU
+onnxruntime-openvino>=1.16.0; sys_platform != 'win32' # CPU fallback
+openvino>=2023.0.0; sys_platform == 'win32'           # Required for Windows OpenVINO setup
 
 # --- TRACKING & UTILS ---
 supervision>=0.16.0

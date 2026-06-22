@@ -17,7 +17,7 @@ class ThreadedCamera:
         import platform
         self.is_windows = platform.system() == "Windows"
 
-        # [BULLETPROOF GUARD] Perform 2s TCP Handshake before opening
+        # [BULLETPROOF GUARD] Perform 0.5s TCP Handshake before opening
         self.is_alive = True
         if isinstance(self.src, str) and "://" in self.src:
             try:
@@ -27,7 +27,7 @@ class ThreadedCamera:
                 port = int(parts[1]) if len(parts) > 1 else 554
                 
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(2.0)
+                sock.settimeout(0.5)
                 if sock.connect_ex((host, port)) != 0:
                     self.is_alive = False
                 sock.close()
@@ -87,7 +87,7 @@ class ThreadedCamera:
                             host = parts[0]
                             port = int(parts[1]) if len(parts) > 1 else 554
                             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                            sock.settimeout(2.0)
+                            sock.settimeout(0.5)
                             alive = (sock.connect_ex((host, port)) == 0)
                             sock.close()
                         
@@ -115,8 +115,10 @@ class ThreadedCamera:
                     except: pass
 
             if self.capture and self.capture.isOpened():
-                if isinstance(self.capture.get(cv2.CAP_PROP_POS_MSEC), (int, float)):
-                    pass # Smooth playback: we do not artificially drop frames here anymore
+                # Flush the internal FFMPEG buffer to prevent streaming lag on RTSP network streams
+                if isinstance(self.src, str) and "://" in self.src:
+                    for _ in range(5):
+                        self.capture.grab()
 
                 status, frame = self.capture.read()
                 if status:
