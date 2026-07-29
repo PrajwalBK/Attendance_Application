@@ -16,10 +16,9 @@ def _get_base_dir():
             local_app_data = os.environ.get('LOCALAPPDATA', os.path.expanduser('~'))
             fallback_dir = os.path.join(local_app_data, 'VisionAttendance')
             os.makedirs(fallback_dir, exist_ok=True)
-            # Bootstrap: copy bundled configurations if they don't exist in LocalAppData yet
-            import shutil
+            asset_dir = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
             for cfg in ['auth_config.json', 'cam_config.json', 'db_config.json']:
-                src = os.path.join(exe_dir, 'config', cfg)
+                src = os.path.join(asset_dir, 'config', cfg)
                 dst = os.path.join(fallback_dir, 'config', cfg)
                 if os.path.exists(src) and not os.path.exists(dst):
                     try:

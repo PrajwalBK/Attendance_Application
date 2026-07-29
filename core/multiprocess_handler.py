@@ -1,14 +1,24 @@
+import sys
 import os
+
 # Configure thread limits BEFORE any scientific library (numpy, opencv, onnxruntime) is imported
-os.environ["OMP_NUM_THREADS"] = "2"
-os.environ["MKL_NUM_THREADS"] = "2"
-os.environ["OPENBLAS_NUM_THREADS"] = "2"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "2"
-os.environ["NUMEXPR_NUM_THREADS"] = "2"
+if getattr(sys, 'frozen', False) or hasattr(sys, 'frozen'):
+    # Restrict frozen mode to 1 thread to prevent thread thrashing under multi-camera worker loads
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+else:
+    os.environ["OMP_NUM_THREADS"] = "2"
+    os.environ["MKL_NUM_THREADS"] = "2"
+    os.environ["OPENBLAS_NUM_THREADS"] = "2"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "2"
+    os.environ["NUMEXPR_NUM_THREADS"] = "2"
 os.environ["ORT_ARENA_EXTEND_STRATEGY"] = "kSameAsRequested"
 
 # AGGRESSIVE RTSP TIMEOUT: 5 seconds (in microseconds)
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|timeout;5000000|stimeout;5000000"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp|fflags;nobuffer|max_delay;500000|timeout;5000000|stimeout;5000000"
 os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 
 import multiprocessing
@@ -40,7 +50,7 @@ class AttendanceWorker(multiprocessing.Process):
     Processes VIDEO FILES instead of live frames.
     Scans every single frame for maximum accuracy.
     """
-    def __init__(self, task_queue, result_queue, worker_id, assigned_cam_index=0, api_user=None, api_pass=None, init_lock=None, event_type=None):
+    def __init__(self, task_queue, result_queue, worker_id, assigned_cam_index=0, api_user=None, api_pass=None, init_lock=None, event_type=None, other_queues=None):
         super().__init__()
         self.task_queue = task_queue
         self.result_queue = result_queue
@@ -50,6 +60,7 @@ class AttendanceWorker(multiprocessing.Process):
         self.api_pass = api_pass
         self.init_lock = init_lock
         self.event_type = event_type # [NEW] Explicit Role (IN, OUT, or None)
+        self.other_queues = other_queues
         self.stop_event = multiprocessing.Event()
         self.daemon = True 
         
@@ -111,35 +122,8 @@ class AttendanceWorker(multiprocessing.Process):
                 # We use lazy_sync=True to keep the lock time minimal (model load only)
                 self.face_handler = FaceRecognitionHandler(self.db, lazy_sync=True)
                 
-                # --- PERSON REID (Stage 3 fallback) ---
-                self.reid = None
-                self._reid_cache = None
-                self._reid_last_save = time.time()
-                self.reid_enabled = config.get('reid_enabled', True)
-                self.reid_autosave_interval = config.get('reid_autosave_interval', 60)
-                
-                if self.reid_enabled:
-                    try:
-                        from core.person_reid import PersonReID
-                        from core.reid_cache_manager import ReIDCacheManager
-                        
-                        self._reid_cache = ReIDCacheManager(config.get('reid_cache_dir'))
-                        gallery = self._reid_cache.load_today()
-                        
-                        self.reid = PersonReID(
-                            model_path=config.get('reid_model_path'),
-                            similarity_threshold=config.get('reid_similarity_threshold', 0.72),
-                            execution_providers=config.get('execution_providers', ["CPUExecutionProvider"]),
-                            temporal_window=config.get('reid_temporal_window', 300.0),
-                        )
-                        self.reid.load_gallery(gallery)
-                        self._log_debug("Person ReID enabled (OSNet).")
-                    except Exception as e:
-                        self._log_debug(f"ReID init failed: {e}. ReID disabled.")
-                        self.reid = None
-                
                 load_duration = time.time() - start_load
-                self._log_debug(f"AI Engine and ReID Loaded in {load_duration:.1f}s.")
+                self._log_debug(f"AI Engine Loaded in {load_duration:.1f}s.")
 
             # --- PHASE 3: Sync Face Data (PARALLEL) ---
             # Now that we've left the lock, we can sync face encodings in parallel
@@ -171,6 +155,7 @@ class AttendanceWorker(multiprocessing.Process):
             # Persistent Cooldown Dictionary: {person_id: timestamp_of_last_log_or_snapshot}
             # This persists across multiple video files for the life of the worker
             self.cooldowns = {} 
+            self.cooldown_events = {} # [NEW] Track last event type for cooldown bypass
             self.last_in_time = {} # [NEW] Loitering Protection 
             
             self._log_debug("Ready. Waiting for files...")
@@ -204,8 +189,23 @@ class AttendanceWorker(multiprocessing.Process):
                         task = self.scavenged_files.pop(0)
                         idle_counter = 0
                     else:
-                        task = self.task_queue.get(timeout=1.0)
-                        idle_counter = 0
+                        try:
+                            task = self.task_queue.get(timeout=1.0)
+                            idle_counter = 0
+                        except queue.Empty:
+                            task = None
+                            if hasattr(self, 'other_queues') and self.other_queues:
+                                for q in self.other_queues:
+                                    if q is not self.task_queue:
+                                        try:
+                                            task = q.get_nowait()
+                                            self._log_debug("Work Stealing: Successfully stole snapshot task from another camera's queue!")
+                                            idle_counter = 0
+                                            break
+                                        except:
+                                            pass
+                            if task is None:
+                                raise queue.Empty
                     
                     # [FIX] Handle commands instead of just filenames
                     if isinstance(task, dict):
@@ -293,7 +293,8 @@ class AttendanceWorker(multiprocessing.Process):
         recovered_files = []
         try:
             # 1. Scavenge pending snapshots
-            pending_dir = "data/pending_snapshots"
+            from config.config import BASE_DIR
+            pending_dir = os.path.join(BASE_DIR, "data", "pending_snapshots")
             if os.path.exists(pending_dir):
                 self._log_debug(f"Scanning for orphaned snapshots in {pending_dir}...")
                 prefix = f'cam_{self.assigned_cam_index}_'
@@ -529,31 +530,9 @@ class AttendanceWorker(multiprocessing.Process):
                             rec_method = person.get('recognition_method')
                             box = person.get('bbox', [0,0,0,0])
                             
-                            # Try ReID fallback if face is not recognized
                             if not pid or pid == 'UNKNOWN':
-                                if self.reid is None:
-                                    self._log_debug("[ReID] Skipping ReID fallback (ReID is disabled or failed to initialize).")
-                                elif self.reid.get_registered_count() == 0:
-                                    self._log_debug("[ReID] Skipping ReID fallback (Dynamic ReID gallery is empty. Face must be recognized first to enroll).")
-                                else:
-                                    reid_id, reid_name, reid_sim = self.reid.identify(frame, box, timestamp=capture_ts)
-                                    if reid_id:
-                                        person['person_id'] = reid_id
-                                        person['person_name'] = reid_name
-                                        person['similarity'] = reid_sim
-                                        person['recognition_method'] = 'body_reid'
-                                        pid = reid_id
-                                        self._log_debug(f"[ReID] Face unrecognized, but ReID body match: {reid_name} ({reid_id}) | Sim: {reid_sim:.2f}")
-                                        
-                            # If unknown, assign a unique temporary ID for this clip summary
-                            if not pid or pid == 'UNKNOWN':
-                                unknown_count += 1
-                                pid = f"UNKNOWN_{unknown_count}"
-                            else:
-                                # Cache body embedding for future ReID (only if recognized by face, not by ReID fallback)
-                                if self.reid is not None and person.get('recognition_method') != 'body_reid':
-                                    self.reid.register_body(pid, person.get('person_name'), frame, box, timestamp=capture_ts)
-                                    self._autosave_reid_cache()
+                                pid = None
+                                person['person_id'] = None
                             
                             # Log mask-aware recognition events
                             if is_masked and rec_method == 'upper_face' and pid and not pid.startswith('UNKNOWN'):
@@ -784,6 +763,12 @@ class AttendanceWorker(multiprocessing.Process):
             # Stage 2: Heavy Recognition (Using configured face detection backend, e.g. YOLOv8)
             faces = self.face_handler.detect_faces(resized_frame)
             
+            # [ROBUST FALLBACK] If no faces detected at downsampled resolution, retry at full resolution
+            if len(faces) == 0 and scale != 1.0:
+                self._log_debug("No faces detected at downsampled 640px, retrying at full resolution...")
+                faces = self.face_handler.detect_faces(frame)
+                scale = 1.0
+            
             # Scale coordinates back
             if scale != 1.0:
                 for face in faces:
@@ -802,40 +787,21 @@ class AttendanceWorker(multiprocessing.Process):
                     is_masked = person.get('is_masked', False)
                     rec_method = person.get('recognition_method')
                     
-                    # Try ReID fallback if face is not recognized
                     if not pid or pid == 'UNKNOWN':
-                        if self.reid is None:
-                            self._log_debug("[ReID] Skipping ReID fallback (ReID is disabled or failed to initialize).")
-                        elif self.reid.get_registered_count() == 0:
-                            self._log_debug("[ReID] Skipping ReID fallback (Dynamic ReID gallery is empty. Face must be recognized first to enroll).")
-                        else:
-                            reid_id, reid_name, reid_sim = self.reid.identify(frame, box, timestamp=capture_ts)
-                            if reid_id:
-                                person['person_id'] = reid_id
-                                person['person_name'] = reid_name
-                                person['similarity'] = reid_sim
-                                person['recognition_method'] = 'body_reid'
-                                pid = reid_id
-                                sim = reid_sim
-                                rec_method = 'body_reid'
-                                self._log_debug(f"[ReID] Face unrecognized, but ReID body match: {reid_name} ({reid_id}) | Sim: {reid_sim:.2f}")
-                                
-                    if pid and not pid.startswith('UNKNOWN'):
-                        if self.reid is not None and person.get('recognition_method') != 'body_reid':
-                            self.reid.register_body(pid, person.get('person_name'), frame, box, timestamp=capture_ts)
-                            self._autosave_reid_cache()
-                    
+                        pid = None
+                        person['person_id'] = None
+
                     # Update DB and generate snapshot
                     success, snapshot_path = self.handle_attendance(person, frame, capture_ts, event_type)
                     if success is False:
                         db_operation_failed = True
                         
-                    if self.result_queue:
+                    if self.result_queue and pid:
                         name = person.get('person_name') or 'UNKNOWN'
                         self.result_queue.put({
                             'type': 'match',
                             'event_type': event_type.upper(),
-                            'id': pid or 'UNKNOWN',
+                            'id': pid,
                             'name': name,
                             'sim': sim,
                             'timestamp': datetime.fromtimestamp(capture_ts).strftime('%H:%M:%S'),
@@ -846,47 +812,7 @@ class AttendanceWorker(multiprocessing.Process):
                             'recognition_method': rec_method
                         })
             else:
-                self._log_debug(f"Snapshot {filename} contained no faces. Checking for bodies...")
-                if self.reid is None:
-                    self._log_debug("[ReID] Skipping ReID body check (ReID is disabled or failed to initialize).")
-                    self._log_debug(f"Snapshot {filename} contained no faces (Triage false positive) and ReID is inactive/empty.")
-                elif self.reid.get_registered_count() == 0:
-                    self._log_debug("[ReID] Skipping ReID body check (Dynamic ReID gallery is empty. Face must be recognized first to enroll).")
-                    self._log_debug(f"Snapshot {filename} contained no faces (Triage false positive) and ReID is inactive/empty.")
-                else:
-                    bodies = self.reid.detect_bodies(frame)
-                    self._log_debug(f"Detected {len(bodies)} bodies in snapshot.")
-                    for body_box in bodies:
-                        reid_id, reid_name, reid_sim = self.reid.identify(frame, body_box, timestamp=capture_ts)
-                        if reid_id:
-                            person = {
-                                'person_id': reid_id,
-                                'person_name': reid_name,
-                                'similarity': reid_sim,
-                                'bbox': body_box,
-                                'recognition_method': 'body_reid',
-                                'is_masked': False
-                            }
-                            self._log_debug(f"[ReID] Snapshot body matched: {reid_name} ({reid_id}) | Sim: {reid_sim:.2f}")
-                            
-                            success, snapshot_path = self.handle_attendance(person, frame, capture_ts, event_type)
-                            if success is False:
-                                db_operation_failed = True
-                                
-                            if self.result_queue:
-                                self.result_queue.put({
-                                    'type': 'match',
-                                    'event_type': event_type.upper(),
-                                    'id': reid_id,
-                                    'name': reid_name,
-                                    'sim': reid_sim,
-                                    'timestamp': datetime.fromtimestamp(capture_ts).strftime('%H:%M:%S'),
-                                    'worker': self.worker_id,
-                                    'bbox': body_box if isinstance(body_box, list) else list(body_box),
-                                    'snapshot_path': snapshot_path,
-                                    'is_masked': False,
-                                    'recognition_method': 'body_reid'
-                                })
+                self._log_debug(f"Snapshot {filename} contained no faces.")
         except Exception as e:
             self._log_debug(f"Error processing snapshot: {e}")
             import traceback
@@ -915,18 +841,19 @@ class AttendanceWorker(multiprocessing.Process):
             self._log_debug(f"[MONITOR MODE] Detected {name or 'Unknown'} (Sim: {sim:.2f}) on monitor camera. Skipping database log & snapshot saving.")
             return True, None
             
-        if not pid: 
-            self._log_debug(f"Face detected but Unknown (Sim: {sim:.2f})")
-            # Don't return early! Proceed to snapshot saving section.
+        if not pid or pid == 'UNKNOWN' or str(pid).startswith('UNKNOWN'): 
+            self._log_debug(f"[UNKNOWN SKIPPED] Face detected but Unknown (Sim: {sim:.2f}). Skipping DB log, API call, & snapshot.")
+            return True, None
         else:
             self._log_debug(f"Recognized: {name} ({pid}) | Sim: {sim:.2f}")
         
         # Use Capture Time for Cooldown Check
         last_marked = self.cooldowns.get(pid, 0)
+        last_event = self.cooldown_events.get(pid, None) if hasattr(self, 'cooldown_events') else None
         
-        # COOLDOWN CHECK: Enforce cooldown based on EVENT TIME
-        if capture_ts - last_marked < self.cooldown_seconds:
-            # Skip DB hit and snapshot if within cooldown
+        # COOLDOWN CHECK: Enforce cooldown based on EVENT TIME, unless event type has changed
+        if (capture_ts - last_marked < self.cooldown_seconds) and (last_event == event_type):
+            # Skip DB hit and snapshot if within cooldown and same event type
             return True, None
 
         # Immediate Database Attempt
@@ -934,59 +861,23 @@ class AttendanceWorker(multiprocessing.Process):
             # Convert timestamp to datetime for display/logging
             capture_dt = datetime.fromtimestamp(capture_ts)
             
-            # --- LOITERING PROTECTION [NEW] ---
-            # Update IN time
-            if event_type == 'in' and pid:
-                self.last_in_time[pid] = capture_ts
-            
-            # Suppress OUT if too soon after IN
-            if event_type == 'out' and pid:
-                 from config import config as cfg_module # [FIX] Import here for access
-                 last_in = self.last_in_time.get(pid, 0)
-                 threshold = getattr(cfg_module, 'LOITERING_THRESHOLD', 60)
-                 if (capture_ts - last_in) < threshold:
-                     self._log_debug(f"Loitering suppressed for {name} (Time since IN: {capture_ts - last_in:.1f}s)")
-                     return True, None # Skip Attendance Update
+            # --- LOITERING PROTECTION [DISABLED] ---
+            # Suppress OUT check removed to allow immediate marking
+            pass
 
-            # 1. Log Raw Event (Ensures 'logs' table is populated)
-            # This is critical for API mode where mark_attendance doesn't auto-log
-            if pid:
-                self.db.log_raw_detection(pid, name, timestamp=capture_dt, event_type=event_type)
-
-            # 2. Update DB with ACTUAL CAPTURE TIME and Event Type
-            # In V1 (API Mode), self.db IS the API Client, so this Call sends the request directly.
-            success, msg = (True, "OK")
-            if pid:
-                success, msg = self.db.mark_attendance(pid, timestamp=capture_dt, event_type=event_type)
-            
-            if not success and pid:
-                self._log_debug(f"Mark Attendance Failed: {msg}")
-                # For API mode, we might want to retry? But let's just log failure for now.
-                return False, None # Signal Failure
-            
-            # 2. Update Cooldown with ACTUAL CAPTURE TIME
-            if pid:
-                self.cooldowns[pid] = capture_ts
-            
-            # 3. Save Snapshot in Categorized Folders
+            # 1. Save Snapshot FIRST to get snapshot_path
             from config.config import get_config
             config = get_config()
-            threshold = config.get('similarity_threshold', 0.4)
+            threshold = config.get('similarity_threshold', 0.55)
             
             snapshot_path = None
             rec_method = person.get('recognition_method', '')
-            # Use the appropriate threshold based on recognition method:
-            # - Masked methods (upper_face, mask_face, mask_face_std) use the lower masked threshold
-            # - Body ReID has its own threshold
-            # - Standard face uses the default similarity threshold
             if rec_method in ('upper_face', 'mask_face', 'mask_face_std'):
                 from config.config import MASKED_SIMILARITY_THRESHOLD
                 save_threshold = MASKED_SIMILARITY_THRESHOLD
-            elif rec_method == 'body_reid':
-                from config.config import REID_SIMILARITY_THRESHOLD
-                save_threshold = REID_SIMILARITY_THRESHOLD
             else:
                 save_threshold = threshold
+                
             if sim >= save_threshold:
                 category = event_type.lower() # 'in' or 'out'
                 if not pid or pid == 'UNKNOWN':
@@ -997,14 +888,66 @@ class AttendanceWorker(multiprocessing.Process):
                 filename = f"{pid}_{int(capture_ts)}.jpg"
                 snapshot_path = os.path.join(target_dir, filename)
                 
-                # [FIX] Robust write with error checking
+                # Robust write with error checking
                 success = cv2.imwrite(snapshot_path, frame)
                 if success:
                     self._log_debug(f"Saved {category.upper()} snapshot: {filename}")
                 else:
                     self._log_debug(f"CRITICAL: Failed to save snapshot to {snapshot_path}. Check permissions/disk space.")
+                    snapshot_path = None
 
-                # AUDIBLE ALERT: Beep twice
+            # 2. Log Raw Event & Mark Attendance with exception checking
+            api_success = True
+            api_msg = "OK"
+            
+            if pid:
+                try:
+                    # Pass the correct snapshot_path to log_raw_detection
+                    self.db.log_raw_detection(pid, name, timestamp=capture_dt, snapshot_path=snapshot_path, event_type=event_type)
+                except Exception as e:
+                    self._log_debug(f"API/DB log_raw_detection Failed: {e}")
+                    api_success = False
+                
+                try:
+                    # Pass the correct snapshot_path to mark_attendance
+                    success, msg = self.db.mark_attendance(pid, timestamp=capture_dt, snapshot_path=snapshot_path, event_type=event_type)
+                    if not success:
+                        api_success = False
+                        api_msg = msg
+                except Exception as e:
+                    api_success = False
+                    api_msg = str(e)
+
+            # If API/DB call failed and we recognized a valid person, handle offline caching
+            if not api_success and pid:
+                self._log_debug(f"Mark Attendance Failed: {api_msg}. Attempting offline cache...")
+                
+                try:
+                    from database.offline_storage import OfflineStorage
+                    storage = OfflineStorage()
+                    timestamp_str = capture_dt.strftime('%Y-%m-%d %H:%M:%S')
+                    storage.add_attendance(pid, timestamp_str, snapshot_path, event_type)
+                    storage.add_raw_log(pid, name, timestamp_str, snapshot_path, event_type)
+                    self._log_debug(f"Successfully cached attendance record locally for {name} ({pid})")
+                except Exception as db_err:
+                    self._log_debug(f"CRITICAL: Failed to write to offline storage: {db_err}")
+                    return False, None # Return False so the snapshot is re-queued/retried if local DB is also failed
+                
+                self.cooldowns[pid] = capture_ts
+                if not hasattr(self, 'cooldown_events'):
+                    self.cooldown_events = {}
+                self.cooldown_events[pid] = event_type
+                return True, snapshot_path
+
+            # Update Cooldown with ACTUAL CAPTURE TIME
+            if pid:
+                self.cooldowns[pid] = capture_ts
+                if not hasattr(self, 'cooldown_events'):
+                    self.cooldown_events = {}
+                self.cooldown_events[pid] = event_type
+            
+            # AUDIBLE ALERT: Beep twice
+            if snapshot_path:
                 try:
                     try:
                         import winsound

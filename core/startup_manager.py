@@ -1,6 +1,11 @@
-import winreg as reg
 import sys
 import os
+
+is_windows = sys.platform == 'win32'
+if is_windows:
+    import winreg as reg
+else:
+    reg = None
 
 class StartupManager:
     APP_NAME = "VisionAttendance"
@@ -8,6 +13,9 @@ class StartupManager:
     @staticmethod
     def enable_auto_startup():
         """Adds the application to the Windows startup registry."""
+        if not is_windows:
+            print("[StartupManager] Auto-startup registry config is Windows-only. Skipping.")
+            return False
         try:
             # We use sys.executable which evaluates to python.exe in dev, 
             # or the compiled .exe when running as a PyInstaller bundle.
@@ -39,6 +47,8 @@ class StartupManager:
     @staticmethod
     def disable_auto_startup():
         """Removes the application from the Windows startup registry."""
+        if not is_windows:
+            return True
         try:
             key = reg.HKEY_CURRENT_USER
             key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"

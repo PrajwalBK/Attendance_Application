@@ -16,10 +16,23 @@ def _get_storage_dir():
             os.makedirs(fallback_dir, exist_ok=True)
             # Bootstrap: copy bundled configurations if they don't exist in LocalAppData yet
             import shutil
+            import json
+            asset_dir = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
             for cfg in ['auth_config.json', 'cam_config.json', 'db_config.json']:
-                src = os.path.join(exe_dir, 'config', cfg)
+                src = os.path.join(asset_dir, 'config', cfg)
                 dst = os.path.join(fallback_dir, 'config', cfg)
-                if os.path.exists(src) and not os.path.exists(dst):
+                
+                should_copy = not os.path.exists(dst)
+                if not should_copy and cfg == 'cam_config.json' and os.path.exists(dst):
+                    try:
+                        with open(dst, 'r') as f:
+                            data = json.load(f)
+                        if data.get("rtsp_template") == "0" or not data.get("discovered_ips"):
+                            should_copy = True
+                    except:
+                        should_copy = True
+
+                if os.path.exists(src) and should_copy:
                     try:
                         os.makedirs(os.path.dirname(dst), exist_ok=True)
                         shutil.copy2(src, dst)
@@ -81,44 +94,47 @@ _YOLO_INT8_PATH = os.path.join(ASSET_DIR, 'data', 'models', 'yolov8n-face_int8.o
 YOLO_MODEL_PATH = _YOLO_INT8_PATH if os.path.exists(_YOLO_INT8_PATH) else _YOLO_FP32_PATH
 YOLO_CONFIDENCE_THRESHOLD = 0.25
 
+# YOLOv8-Body/Person Model Config (COCO)
+YOLO_BODY_MODEL_PATH = os.path.join(ASSET_DIR, 'data', 'models', 'yolov8n.onnx')
+YOLO_BODY_CONFIDENCE_THRESHOLD = 0.35
+
 PROCESSED_RECORDINGS_DIR = os.path.join(BASE_DIR, 'data', 'processed_recordings')
 VIDEO_CHUNK_DURATION = 30  # Seconds per video file
 RECORD_VIDEO = False  # Set to True to save video files, False to disable saving video files
 
 
 # Face Recognition Settings
-SIMILARITY_THRESHOLD = 0.4  
+SIMILARITY_THRESHOLD = 0.4  # Stricter face match threshold to prevent unregistered employees from matching by chance (was 0.40)
 DETECTION_SIZE = (1024, 1024) 
 FACE_DETECTION_MODEL = 'buffalo_l' 
 
 # --- MASK DETECTION SETTINGS ---
 MASK_DETECTION_ENABLED = True             # Master switch for mask-aware recognition
-MASKED_SIMILARITY_THRESHOLD = 0.25        # Lower threshold for masked face matching (was 0.35; lowered to accept near-miss scores ~0.29)
+MASKED_SIMILARITY_THRESHOLD = 0.35        # Threshold for masked face matching (upper-face crop)
 UPPER_FACE_CROP_RATIO = 0.55             # Crop top 55% of face bounding box for upper-face embedding
 MASK_NOSE_RATIO_THRESHOLD = 0.30          # Landmark heuristic: nose-to-eye ratio
 MASK_MOUTH_RATIO_THRESHOLD = 0.22         # Landmark heuristic: mouth drop ratio
 MASK_MOUTH_SPREAD_THRESHOLD = 0.35        # Landmark heuristic: mouth width ratio
 
-# --- PERSON RE-ID SETTINGS (OSNet body-appearance fallback) ---
-REID_ENABLED              = True          # Master switch — False disables all ReID
-REID_MODEL_PATH           = os.path.join(ASSET_DIR, 'data', 'models', 'osnet_ibn_x1_0.onnx')
-REID_SIMILARITY_THRESHOLD = 0.72          # Cosine similarity required for a body match
-REID_CACHE_DIR            = os.path.join(BASE_DIR,  'data', 'reid_cache')  # Daily cache dir
-REID_AUTOSAVE_INTERVAL    = 60            # Seconds between auto-saves of the ReID gallery
-REID_TEMPORAL_WINDOW      = 43200         # Keep body templates active for 43200 seconds (12 hours)
-                                            # (was 300s — too long given hospital staff often
-                                            # wear similar-coloured scrubs; a tighter window
-                                            # reduces the chance of matching the wrong person
-                                            # who happens to be dressed similarly)
-
 # Execution Providers (GPU/CPU)
-EXECUTION_PROVIDERS = [
-    'CPUExecutionProvider'
-]
+import ctypes.util
+import onnxruntime as ort
+EXECUTION_PROVIDERS = []
+# Only attempt to use OpenVINO if its library DLL is present on the system search path,
+# it is listed as an available provider, and we are NOT running inside the frozen PyInstaller EXE (provider DLL is excluded).
+if not getattr(sys, 'frozen', False):
+    if ctypes.util.find_library('openvino') is not None and 'OpenVINOExecutionProvider' in ort.get_available_providers():
+        EXECUTION_PROVIDERS.append('OpenVINOExecutionProvider')
+EXECUTION_PROVIDERS.append('CPUExecutionProvider')
 
 # ONNX Runtime Thread Limits
-ORT_INTRA_OP_NUM_THREADS = 2
-ORT_INTER_OP_NUM_THREADS = 2
+if getattr(sys, 'frozen', False):
+    # Restrict to 1 thread per session inside frozen EXE to prevent CPU thread thrashing across 6 cameras
+    ORT_INTRA_OP_NUM_THREADS = 1
+    ORT_INTER_OP_NUM_THREADS = 1
+else:
+    ORT_INTRA_OP_NUM_THREADS = 2
+    ORT_INTER_OP_NUM_THREADS = 2
 
 # Detection Backend Configuration
 # Options: 'insightface' (Default, Accurate) | 'opencv_dnn' (Faster, Less Accurate) | 'yolov8' (High Accuracy, Fast)
@@ -223,8 +239,9 @@ DISPLAY_FPS = True
 DISPLAY_INFO_PANEL = True
 
 # Performance Optimization
-PROCESS_EVERY_N_FRAMES = 4    # Process every 4th frame for high CPU efficiency
+PROCESS_EVERY_N_FRAMES = 1    # Process every frame for continuous detection
 RESIZE_FACTOR = 1.0           # No resizing for maximum detail         
+USE_HIGH_RES_SNAPSHOTS = False # Set to False to capture snapshots instantly from sub-stream, avoiding network/decoding delay         
 
 # Annotation Settings
 BOX_THICKNESS = 2
@@ -287,6 +304,8 @@ def get_config():
         'dnn_confidence_threshold': DNN_CONFIDENCE_THRESHOLD,
         'yolo_model_path': YOLO_MODEL_PATH,
         'yolo_confidence_threshold': YOLO_CONFIDENCE_THRESHOLD,
+        'yolo_body_model_path': YOLO_BODY_MODEL_PATH,
+        'yolo_body_confidence_threshold': YOLO_BODY_CONFIDENCE_THRESHOLD,
         'show_detection_score': SHOW_DETECTION_SCORE,
         'temp_recordings_dir': TEMP_RECORDINGS_DIR,
         'verified_log_path': VERIFIED_LOG_PATH,
@@ -309,12 +328,7 @@ def get_config():
         'mask_nose_ratio_threshold': MASK_NOSE_RATIO_THRESHOLD,
         'mask_mouth_ratio_threshold': MASK_MOUTH_RATIO_THRESHOLD,
         'mask_mouth_spread_threshold': MASK_MOUTH_SPREAD_THRESHOLD,
-        # Person ReID
-        'reid_enabled': REID_ENABLED,
-        'reid_model_path': REID_MODEL_PATH,
-        'reid_similarity_threshold': REID_SIMILARITY_THRESHOLD,
-        'reid_cache_dir': REID_CACHE_DIR,
-        'reid_autosave_interval': REID_AUTOSAVE_INTERVAL,
+        'use_high_res_snapshots': USE_HIGH_RES_SNAPSHOTS,
     }
 
 def validate_config():

@@ -21,6 +21,9 @@ class AttendanceTracker:
         1. Log Face: 90s gap
         2. Update Attendance: 5s gap (with Voice Feedback)
         """
+        if not person_id or person_id == 'UNKNOWN' or str(person_id).startswith('UNKNOWN'):
+            return True, None
+
         current_ts = time.time()
         
         # Determine event type (Method arg overrides Instance var)

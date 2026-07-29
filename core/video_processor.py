@@ -4,11 +4,7 @@ import supervision as sv
 import os
 import time
 from datetime import datetime
-from config.config import (
-    UNKNOWN_FACES_DIR, SNAPSHOTS_DIR,
-    REID_ENABLED, REID_MODEL_PATH, REID_SIMILARITY_THRESHOLD,
-    REID_CACHE_DIR, REID_AUTOSAVE_INTERVAL, EXECUTION_PROVIDERS
-)
+from config.config import UNKNOWN_FACES_DIR, SNAPSHOTS_DIR, EXECUTION_PROVIDERS
 
 class VideoProcessor:
     def __init__(self, face_handler):
@@ -35,9 +31,6 @@ class VideoProcessor:
         # Initialize Annotator
         self.box_annotator = sv.BoxAnnotator(
             thickness=2,
-            # text_thickness=1, # Removed for compatibility
-            # text_scale=0.5,   # Removed for compatibility
-            # text_padding=5    # Removed for compatibility
         )
         
         # Track recognized faces (The Cache)
@@ -52,30 +45,6 @@ class VideoProcessor:
 
         if not os.path.exists(SNAPSHOTS_DIR):
             os.makedirs(SNAPSHOTS_DIR)
-
-        # ── Person ReID (Stage 3 fallback) ──────────────────────────────────
-        self.reid = None
-        self._reid_cache = None
-        self._reid_last_save = time.time()
-
-        if REID_ENABLED:
-            try:
-                from core.person_reid import PersonReID
-                from core.reid_cache_manager import ReIDCacheManager
-
-                self._reid_cache = ReIDCacheManager(REID_CACHE_DIR)
-                gallery = self._reid_cache.load_today()
-
-                self.reid = PersonReID(
-                    model_path=REID_MODEL_PATH,
-                    similarity_threshold=REID_SIMILARITY_THRESHOLD,
-                    execution_providers=EXECUTION_PROVIDERS,
-                )
-                self.reid.load_gallery(gallery)
-                print("[VideoProcessor] Person ReID enabled (OSNet).")
-            except Exception as e:
-                print(f"[VideoProcessor] ReID init failed: {e}. ReID disabled.")
-                self.reid = None
     
     def clear_cache(self):
         """Forces the processor to forget currently tracked faces"""
@@ -208,43 +177,23 @@ class VideoProcessor:
                             person_id, person_name, similarity = self.face_handler.recognize_face(best_face.embedding)
                             
                             # --- MASK-AWARE FALLBACK ---
-                            # If standard recognition failed, check for mask and retry with upper-face
+                            # If standard recognition failed, check for mask and try upper-face matching
                             if not person_id and self.face_handler.mask_detection_enabled:
-                                is_masked = self.face_handler.detect_mask(frame, best_face)  # V5: (frame, face), returns bool
-                                
+                                is_masked = self.face_handler.detect_mask(frame, best_face)
                                 if is_masked:
                                     upper_emb = self.face_handler.extract_upper_face_encoding(frame, best_face.bbox)
                                     if upper_emb is not None:
-                                        person_id, person_name, similarity, rec_method = \
-                                            self.face_handler.recognize_face_masked(best_face.embedding, upper_emb)
-                                        
-                                        if person_id:
-                                            self.tracker_id_to_person[tracker_id] = (person_id, person_name)
-                                            
-                                            score_str = f" {best_face.det_score:.2f}" if SHOW_DETECTION_SCORE else ""
-                                            label = f"\U0001f637 {person_name} ({person_id}){score_str}"
-                                            
-                                            if mark_attendance_callback:
-                                                snapshot_path = self._save_face_snapshot(frame, current_bbox, person_id, SNAPSHOTS_DIR)
-                                                success, message = mark_attendance_callback(person_id, person_name, snapshot_path)
-                                                if success and message:
-                                                    messages.append(message)
-                                            
-                                            labels.append(label)
-                                            continue
+                                        m_id, m_name, m_sim = self.face_handler.recognize_face_masked_direct(upper_emb)
+                                        if m_id:
+                                            person_id = m_id
+                                            person_name = m_name
+                                            similarity = m_sim
                             
                             if person_id:
                                 self.tracker_id_to_person[tracker_id] = (person_id, person_name)
 
                                 score_str = f" {best_face.det_score:.2f}" if SHOW_DETECTION_SCORE else ""
                                 label = f"{person_name} ({person_id}){score_str}"
-
-                                # ── Cache body embedding for future ReID ────
-                                if self.reid is not None:
-                                    self.reid.register_body(
-                                        person_id, person_name, frame, current_bbox
-                                    )
-                                    self._autosave_reid_cache()
 
                                 if mark_attendance_callback:
                                     # --- CAPTURE SNAPSHOT (EMPLOYEE) ---
@@ -254,28 +203,6 @@ class VideoProcessor:
                                     if success and message:
                                         messages.append(message)
                             else:
-                                # ── Stage 3: Body ReID fallback ─────────────
-                                if self.reid is not None and self.reid.get_registered_count() > 0:
-                                    reid_id, reid_name, reid_sim = self.reid.identify(
-                                        frame, current_bbox
-                                    )
-                                    if reid_id:
-                                        self.tracker_id_to_person[tracker_id] = (reid_id, reid_name)
-                                        score_str = f" {reid_sim:.2f}" if SHOW_DETECTION_SCORE else ""
-                                        label = f"\U0001f6b6 {reid_name} ({reid_id}){score_str}"
-
-                                        if mark_attendance_callback:
-                                            snapshot_path = self._save_face_snapshot(
-                                                frame, current_bbox, reid_id, SNAPSHOTS_DIR
-                                            )
-                                            success, message = mark_attendance_callback(
-                                                reid_id, reid_name, snapshot_path
-                                            )
-                                            if success and message:
-                                                messages.append(message)
-                                        labels.append(label)
-                                        continue
-
                                 score_str = f" {best_face.det_score:.2f}" if SHOW_DETECTION_SCORE else ""
                                 label = f"Unknown #{tracker_id}{score_str}"
                         else:

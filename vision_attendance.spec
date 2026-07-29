@@ -5,9 +5,21 @@ from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules, co
 
 block_cipher = None
 
-# --- Automated Dependency Collection ---
-# Collect ONNX Runtime DLLs (Critical for Face Detection)
-binaries = collect_dynamic_libs('onnxruntime')
+# Collect ONNX Runtime DLLs (excluding OpenVINO provider to prevent DLL version mismatch popups)
+binaries = []
+for path, dest in collect_dynamic_libs('onnxruntime'):
+    if 'openvino' not in os.path.basename(path).lower():
+        binaries.append((path, dest))
+    else:
+        print(f"[SPEC] Excluded OpenVINO provider: {path}")
+
+# [DLL FIX] Add OpenCV FFMPEG DLL to the root so Windows LoadLibrary can find it
+import cv2
+cv2_dir = os.path.dirname(cv2.__file__)
+for f in os.listdir(cv2_dir):
+    if 'ffmpeg' in f.lower() and f.endswith('.dll'):
+        binaries.append((os.path.join(cv2_dir, f), '.'))
+        print(f"[SPEC] Added OpenCV FFMPEG DLL: {f}")
 
 # Collect hidden imports for AI libraries
 hidden_imports = (
@@ -53,7 +65,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['tkinter', 'tcl', 'tk'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -91,3 +103,19 @@ coll = COLLECT(
     upx_exclude=[],
     name='VisionAttendance'
 )
+
+# [POST-BUILD DLL COPY] Copy FFMPEG DLL to the root directory to guarantee it's found by LoadLibrary
+try:
+    import shutil
+    for folder in ['VisionAttendance', 'VisionAttendanceYolo4']:
+        dist_dir = os.path.join('dist', folder)
+        cv2_dir_in_dist = os.path.join(dist_dir, 'cv2')
+        if os.path.exists(cv2_dir_in_dist):
+            for f in os.listdir(cv2_dir_in_dist):
+                if 'ffmpeg' in f.lower() and f.endswith('.dll'):
+                    src_dll = os.path.join(cv2_dir_in_dist, f)
+                    dst_dll = os.path.join(dist_dir, f)
+                    shutil.copy2(src_dll, dst_dll)
+                    print(f"\n[POST-BUILD SUCCESS] Copied FFMPEG DLL to root: {dst_dll}\n")
+except Exception as post_err:
+    print(f"\n[POST-BUILD ERROR] Failed to copy FFMPEG DLL to root: {post_err}\n")

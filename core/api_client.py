@@ -9,13 +9,19 @@ from datetime import datetime, date
 
 # Setup Logging
 from config.config import BASE_DIR, get_config
+import sys
 
 base_dir = BASE_DIR
 
-log_file = os.path.join(base_dir, 'logs', 'db_debug.log')
-os.makedirs(os.path.dirname(log_file), exist_ok=True)
-logging.basicConfig(filename=log_file, level=logging.INFO, 
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+if getattr(sys, 'frozen', False):
+    # In frozen EXE, log to stdout/stderr (which is redirected to NullWriter), avoiding Windows process-level file lock deadlocks
+    logging.basicConfig(level=logging.WARNING, 
+                        format='%(asctime)s - %(levelname)s - %(message)s')
+else:
+    log_file = os.path.join(base_dir, 'logs', 'db_debug.log')
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    logging.basicConfig(filename=log_file, level=logging.INFO, 
+                        format='%(asctime)s - %(levelname)s - %(message)s')
 
 
 class APIClient:
@@ -146,6 +152,13 @@ class APIClient:
             else:
                 face_encoding_str = None
 
+            # Pickle and base64 encode mask_face_encoding
+            if mask_face_encoding is not None:
+                pickled_mask = pickle.dumps(mask_face_encoding)
+                mask_encoding_str = base64.b64encode(pickled_mask).decode('utf-8')
+            else:
+                mask_encoding_str = None
+
             payload = {
                 "person_id": person_id,
                 "name": name,
@@ -154,7 +167,8 @@ class APIClient:
                 "designation": designation,
                 "shift_start": shift_start,
                 "shift_end": shift_end,
-                "face_encoding": face_encoding_str
+                "face_encoding": face_encoding_str,
+                "mask_face_encoding": mask_encoding_str
             }
             
             response = self._api_request('POST', "/api/persons/", json=payload, timeout=10)
@@ -255,7 +269,7 @@ class APIClient:
             else:
                 logging.error(f"mark_attendance API Error: {resp.status_code} - {resp.text}")
                 print(f"[DEBUG] APIClient: Error {resp.status_code} - {resp.text}")
-                return False, f"API Error: {resp.text}"
+                return False, f"API Error {resp.status_code}: {resp.text}"
 
         except Exception as e:
             logging.error(f"mark_attendance Exception: {e}")
@@ -301,40 +315,49 @@ class APIClient:
                 for p in persons:
                     pid = p.get('person_id')
                     name = p.get('name', 'Unknown')
-                    encoded_data = p.get('face_encoding')
                     
+                    face_data = None
+                    encoded_data = p.get('face_encoding')
                     if encoded_data:
                         try:
                             # Format A: JSON Array (starts with '[')
                             if encoded_data.strip().startswith('['):
-                                try:
-                                    import json
-                                    face_data = np.array(json.loads(encoded_data))
-                                    encodings[pid] = {
-                                        'name': name,
-                                        'encoding': face_data
-                                    }
-                                    continue
-                                except Exception as json_err:
-                                    print(f"Error parsing JSON face for {name} ({pid}): {json_err}")
-                            
-                            # Format B: Base64 -> Pickle
-                            missing_padding = len(encoded_data) % 4
-                            if missing_padding:
-                                encoded_data += '=' * (4 - missing_padding)
-                            
-                            try:
+                                import json
+                                face_data = np.array(json.loads(encoded_data))
+                            else:
+                                # Format B: Base64 -> Pickle
+                                missing_padding = len(encoded_data) % 4
+                                if missing_padding:
+                                    encoded_data += '=' * (4 - missing_padding)
                                 decoded_bytes = base64.b64decode(encoded_data)
                                 face_data = pickle.loads(decoded_bytes)
-                                encodings[pid] = {
-                                    'name': name,
-                                    'encoding': face_data
-                                }
-                            except Exception as decode_err:
-                                first_chars = encoded_data[:15] + "..." if len(encoded_data) > 15 else encoded_data
-                                print(f"Error decoding face for {name} ({pid}): {decode_err}")
                         except Exception as e:
-                            print(f"Error decoding face for {name} ({pid}): {e}")
+                            print(f"Error decoding face_encoding for {name} ({pid}): {e}")
+                    
+                    mask_data = None
+                    encoded_mask = p.get('mask_face_encoding')
+                    if encoded_mask:
+                        try:
+                            # Format A: JSON Array (starts with '[')
+                            if encoded_mask.strip().startswith('['):
+                                import json
+                                mask_data = np.array(json.loads(encoded_mask))
+                            else:
+                                # Format B: Base64 -> Pickle
+                                missing_padding = len(encoded_mask) % 4
+                                if missing_padding:
+                                    encoded_mask += '=' * (4 - missing_padding)
+                                decoded_bytes = base64.b64decode(encoded_mask)
+                                mask_data = pickle.loads(decoded_bytes)
+                        except Exception as e:
+                            print(f"Error decoding mask_face_encoding for {name} ({pid}): {e}")
+
+                    if face_data is not None or mask_data is not None:
+                        encodings[pid] = {
+                            'name': name,
+                            'encoding': face_data,
+                            'mask_encoding': mask_data
+                        }
                 return encodings
             else:
                  print(f"[DEBUG] Fetch Failed: {response.text}")

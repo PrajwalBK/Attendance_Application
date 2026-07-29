@@ -1,59 +1,84 @@
-# Raspberry Pi Setup Instructions
+# Raspberry Pi Setup Instructions (Linux ARM64 / Python 3.13)
 
-To run the Face Attendance System on a Raspberry Pi, you need to configure the environment for the ARM architecture and use the provided desktop launcher.
+To run the Face Attendance System on a Raspberry Pi, configure the environment for the ARM architecture using system packages for heavy dependencies, then compile the native executable.
 
-## 1. Move Files to the Raspberry Pi
-1. Copy the entire `desktop_application-v1` folder to your Raspberry Pi. We recommend placing it in the home directory: `/home/prosper123/desktop_application-v1`.
+---
+
+## 1. Package the Code on Windows
+1. Double-click `build_pi_zip.bat` on your Windows PC.
+2. This generates a clean `VisionAttendance_Pi.zip` containing all python files, spec sheets, and models (excluding redundant raw backups).
+3. Copy `VisionAttendance_Pi.zip` to your Raspberry Pi.
+
+---
 
 ## 2. Install System Dependencies
-Open a terminal on your Raspberry Pi and run:
+On your Raspberry Pi, open a terminal and install the pre-compiled system libraries for OpenCV and PySide6 to avoid long ARM compilation times:
 ```bash
 sudo apt update
-sudo apt install python3-pip python3-venv python3-opencv libatlas-base-dev libhdf5-dev libhdf5-serial-dev
+sudo apt install -y python3-pip python3-venv python3-opencv python3-pyside6 libhdf5-dev build-essential python3-dev
 ```
 
-## 3. Set Up Python Environment
-Create and activate a virtual environment:
+---
+
+## 3. Set Up the Python Environment
+Create the virtual environment enabling access to the system packages so that `cv2` (OpenCV) and `PySide6` are inherited:
 ```bash
-cd /home/prosper123/desktop_application-v1
-python3 -m venv venv
+# Extract files
+unzip -o VisionAttendance_Pi.zip -d ~/visionattendance
+cd ~/visionattendance
+
+# Create venv with system site packages enabled
+python3 -m venv --system-site-packages venv
 source venv/bin/activate
 ```
 
-## 4. Install Python Packages
-Install the required packages. **Crucially**, you must install the standard CPU version of `onnxruntime`, as the GPU version (`onnxruntime-gpu`) does not work on standard Raspberry Pi OS.
+---
 
+## 4. Install Python Packages & Build InsightFace
+Install other Python dependencies and compile the `insightface` C++ extensions inside the virtual environment:
 ```bash
-# Install OpenCV and basic requirements
+# Install cython (required to build insightface)
+pip install cython
+
+# Install all other python requirements
 pip install -r requirements.txt
 
-# Manually uninstall any existing onnxruntime packages to prevent conflicts
-pip uninstall -y onnxruntime onnxruntime-gpu
-
-# Install the ARM-compatible CPU version
-pip install onnxruntime
+# Install and build insightface
+pip install insightface
 ```
 
-## 5. Configure for CPU Fallback
-The `config/config.py` file is already set up to include `CPUExecutionProvider` as a fallback. When the app runs on the Pi, it will gracefully fall back from CUDA (GPU) to the CPU. 
-_Note: Inference will be slower on the Pi CPU compared to a PC._
+---
 
-## 6. Enable Desktop Shortcut (Double-Click Launch)
-We have provided `run_attendance.sh` and `AttendanceSystem.desktop` to let you launch the app directly from your desktop.
+## 5. Compile the Native Executable
+Force PyInstaller to compile inside the virtual environment:
+```bash
+# Give execute permission to the build script
+chmod +x scripts/build_pi.sh
 
-1. Ensure the script is executable:
+# Run the build script
+./scripts/build_pi.sh
+```
+*Note: Your compiled standalone folder will be generated at `dist/pi_exe/`.*
+
+---
+
+## 6. Run the Application
+* **To run directly via Python**:
+  ```bash
+  python gui.py
+  ```
+* **To run the compiled binary**:
+  ```bash
+  ./dist/pi_exe/VisionAttendance
+  ```
+
+---
+
+## 7. Enable Desktop Shortcut (Double-Click Launch)
+To run the executable by double-clicking a desktop icon:
+1. Copy the desktop launcher to your Pi Desktop:
    ```bash
-   cd /home/prosper123/desktop_application-v1
-   chmod +x run_attendance.sh
+   cp AttendanceSystem.desktop ~/Desktop/
    ```
-2. Open the `AttendanceSystem.desktop` file in a text editor.
-   - Verify the `Exec` path matches where you put the folder (e.g., `/home/prosper123/desktop_application-v1`).
-   - Verify the `Icon` path matches the location of the `prosper1.png` file.
-3. Move or copy `AttendanceSystem.desktop` to your Raspberry Pi's Desktop:
-   ```bash
-   cp AttendanceSystem.desktop /home/prosper123/Desktop/
-   ```
-4. On your Raspberry Pi Desktop, double-click the **Attendance AI System** icon. 
-   - You may be prompted to trust or make the file executable the first time you click it. Accept to launch the app.
-   
-If the app closes immediately when double-clicked, open the `pi_gui_log.txt` file generated in the application folder to see the error details.
+2. You can now launch the app directly from your desktop grid!
+

@@ -315,29 +315,8 @@ class DatabaseManager:
                 if event_type == 'out':
                     # LOGOUT: Update existing open session
                     
-                    # [FIX] Minimum Session Duration to prevent "Instant Logout" (Bouncing)
-                    # If user is seen by IN and OUT cameras simultaneously, we ignore OUT if < 60s.
-                    try:
-                        fmt = '%H:%M:%S'
-                        # Fix: Check length or count to distinguish format for arrival_time
-                        if str(first_arrival).count(':') == 1: fmt = '%H:%M'
-                        
-                        t_arr = datetime.strptime(str(first_arrival), fmt)
-                        
-                        # Match current_time format
-                        t_now = datetime.strptime(current_time, '%H:%M:%S')
-                        
-                        # Adjust for date crossing (rare for day shift but possible)
-                        if t_now < t_arr: # e.g. Arr 23:59, Leave 00:01
-                             # Just skip check to be safe
-                             pass
-                        else:
-                            duration = (t_now - t_arr).total_seconds()
-                            if duration < 60:
-                                print(f"[DEBUG] DB: Ignoring OUT event. Session too short ({duration}s < 60s).")
-                                return True, "Ignored: Session too short (Prevented Instant Logout)"
-                    except Exception as e:
-                        print(f"Duration check error: {e}")
+                    # Minimum Session Duration check removed to allow immediate marking
+                    pass
 
                     print(f"[DEBUG] DB: Found record {rec_id} (Status: {current_status}). Event: OUT. Updating...")
                     cursor.execute('''

@@ -1,17 +1,36 @@
+import sys
 import os
+# Ensure the directory of gui.py is in the search path for relative imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Safe stdout/stderr redirection for PyInstaller frozen windowed mode to prevent print blocking/stalls
+if hasattr(sys, 'frozen'):
+    class NullWriter:
+        def write(self, text): pass
+        def flush(self): pass
+    sys.stdout = NullWriter()
+    sys.stderr = NullWriter()
+
 # Configure thread limits BEFORE any scientific library (numpy, opencv, onnxruntime) is imported
-os.environ["OMP_NUM_THREADS"] = "2"
-os.environ["MKL_NUM_THREADS"] = "2"
-os.environ["OPENBLAS_NUM_THREADS"] = "2"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "2"
-os.environ["NUMEXPR_NUM_THREADS"] = "2"
+if hasattr(sys, 'frozen'):
+    # Restrict frozen mode to 1 thread to prevent thread thrashing under multi-camera loads
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+else:
+    os.environ["OMP_NUM_THREADS"] = "2"
+    os.environ["MKL_NUM_THREADS"] = "2"
+    os.environ["OPENBLAS_NUM_THREADS"] = "2"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "2"
+    os.environ["NUMEXPR_NUM_THREADS"] = "2"
 os.environ["ORT_ARENA_EXTEND_STRATEGY"] = "kSameAsRequested"
 
 # AGGRESSIVE RTSP TIMEOUT: 5 seconds (in microseconds)
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|timeout;5000000|stimeout;5000000"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|max_delay;500000|timeout;5000000|stimeout;5000000"
 os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 
-import sys
 import threading
 import time
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -67,17 +86,20 @@ class MainWindow(QMainWindow):
         else:
             StartupManager.disable_auto_startup()
 
+    def trigger_start_detection(self):
+        """Wrapper method called from GUI event loop to safely trigger start_detection in backend."""
+        print("[GUI] trigger_start_detection wrapper called", flush=True)
+        self.backend.start_detection()
+
     def _auto_start_sequence(self):
+        print("[AUTO-START] _auto_start_sequence fired!", flush=True)
         # Sync faces in background first so it doesn't block UI during slow boot
         threading.Thread(target=self.backend.sync_remote_faces, daemon=True).start()
         
         # 1. Start Cameras (Instant)
         if not self.backend.are_cameras_active:
+            print("[AUTO-START] Calling toggle_cameras()...", flush=True)
             self.toggle_cameras()
-            
-        # 2. Wait 3 seconds for rtsp handshakes, then start AI Workers
-        # Reduced from 5s to 3s for "fast start" requirement while keeping stability
-        QTimer.singleShot(3000, self.backend.start_detection)
 
     def _update_queue_status(self):
         try:
@@ -466,6 +488,8 @@ class MainWindow(QMainWindow):
                     role = ["entrance", "exit", "monitor"][w.role_selector.currentIndex()]
                     self.backend.set_cam_role(i, role)
                 self.backend.start_cameras(*srcs)
+                # Automatically start AI workers when cameras are started
+                QTimer.singleShot(2500, self.trigger_start_detection)
                 
                 # Save config WITHOUT destroying existing IP data
                 from config.cam_config_manager import CamConfigManager
