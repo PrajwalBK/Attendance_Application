@@ -3,56 +3,152 @@
     "primary_source": "Channel 1",
     "secondary_source": "Channel 2",
     "num_channels": 16,
-    "auto_start_on_boot": false,
-    "active_cam_count": 4,
+    "auto_start_on_boot": true,
+    "active_cam_count": 2,
     "cams": [
         {
             "name": "CAMERA 1",
             "source": "Camera 8",
-            "role": "monitor",
-            "ip": "192.168.1.240"
+            "role": "entrance",
+            "ip": "192.168.1.240",
+            "roi": [
+                0.0,
+                0.0,
+                1.0,
+                1.0
+            ],
+            "direction_rules": {
+                "up": "out",
+                "down": "in",
+                "left": "ignore",
+                "right": "ignore"
+            }
         },
         {
             "name": "CAMERA 2",
             "source": "Camera 6",
-            "role": "monitor",
-            "ip": "192.168.1.240"
+            "role": "exit",
+            "ip": "192.168.1.240",
+            "roi": [
+                0.0,
+                0.0,
+                1.0,
+                1.0
+            ],
+            "direction_rules": {
+                "up": "out",
+                "down": "in",
+                "left": "ignore",
+                "right": "ignore"
+            }
         },
         {
             "name": "CAMERA 3",
-            "source": "Camera 1",
+            "source": "Camera 3",
             "role": "entrance",
-            "ip": "192.168.1.240"
+            "ip": "192.168.1.240",
+            "roi": [
+                0.0,
+                0.0,
+                1.0,
+                1.0
+            ],
+            "direction_rules": {
+                "up": "out",
+                "down": "in",
+                "left": "ignore",
+                "right": "ignore"
+            }
         },
         {
             "name": "CAMERA 4",
             "source": "Camera 4",
-            "role": "monitor",
-            "ip": "192.168.1.240"
+            "role": "entrance",
+            "ip": "192.168.1.240",
+            "roi": [
+                0.0,
+                0.0,
+                1.0,
+                1.0
+            ],
+            "direction_rules": {
+                "up": "out",
+                "down": "in",
+                "left": "ignore",
+                "right": "ignore"
+            }
         },
         {
             "name": "CAMERA 5",
             "source": "Camera 5",
-            "role": "monitor",
-            "ip": "192.168.1.240"
+            "role": "entrance",
+            "ip": "192.168.1.240",
+            "roi": [
+                0.0,
+                0.0,
+                1.0,
+                1.0
+            ],
+            "direction_rules": {
+                "up": "out",
+                "down": "in",
+                "left": "ignore",
+                "right": "ignore"
+            }
         },
         {
             "name": "CAMERA 6",
             "source": "Camera 6",
-            "role": "monitor",
-            "ip": "192.168.1.240"
+            "role": "entrance",
+            "ip": "192.168.1.240",
+            "roi": [
+                0.0,
+                0.0,
+                1.0,
+                1.0
+            ],
+            "direction_rules": {
+                "up": "out",
+                "down": "in",
+                "left": "ignore",
+                "right": "ignore"
+            }
         },
         {
             "name": "CAMERA 7",
             "source": "Camera 7",
             "role": "monitor",
-            "ip": "192.168.1.240"
+            "ip": "192.168.1.240",
+            "roi": [
+                0.0,
+                0.0,
+                1.0,
+                1.0
+            ],
+            "direction_rules": {
+                "up": "out",
+                "down": "in",
+                "left": "ignore",
+                "right": "ignore"
+            }
         },
         {
             "name": "CAMERA 8",
             "source": "Camera 8",
             "role": "monitor",
-            "ip": "192.168.1.240"
+            "ip": "192.168.1.240",
+            "roi": [
+                0.0,
+                0.0,
+                1.0,
+                1.0
+            ],
+            "direction_rules": {
+                "up": "out",
+                "down": "in",
+                "left": "ignore",
+                "right": "ignore"
+            }
         }
     ],
     "discovered_ips": [

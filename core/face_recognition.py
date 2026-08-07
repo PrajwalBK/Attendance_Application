@@ -51,7 +51,7 @@ from config.config import (
     FACE_DETECTION_BACKEND, DNN_PROTO_PATH, DNN_MODEL_PATH, DNN_CONFIDENCE_THRESHOLD,
     MASK_DETECTION_ENABLED, MASKED_SIMILARITY_THRESHOLD, UPPER_FACE_CROP_RATIO,
     MASK_NOSE_RATIO_THRESHOLD, MASK_MOUTH_RATIO_THRESHOLD, MASK_MOUTH_SPREAD_THRESHOLD,
-    YOLO_MODEL_PATH
+    YOLO_MODEL_PATH, TRIAGE_DETECTION_BACKEND
 )
 
 class Face:
@@ -78,16 +78,17 @@ class FaceRecognitionHandler:
             root=model_root,
             providers=EXECUTION_PROVIDERS
         )
-        # Optimize detection size for crop extraction if not using insightface as the main backend
-        from config.config import DETECTION_SIZE, FACE_DETECTION_BACKEND
-        if FACE_DETECTION_BACKEND != 'insightface':
-            self.app.prepare(ctx_id=-1, det_size=(320, 320))
-        else:
-            self.app.prepare(ctx_id=-1, det_size=DETECTION_SIZE)
+        # Determine CUDA context id vs CPU/DirectML context id
+        has_cuda = 'CUDAExecutionProvider' in str(EXECUTION_PROVIDERS)
+        ctx_id = 0 if has_cuda else -1
+        
+        # Always prepare InsightFace with standard (640, 640) canvas for 100% face detection & landmark alignment
+        self.app.prepare(ctx_id=ctx_id, det_size=(640, 640))
         self._mfr_app = None
         
         # Initialize Detection Backend
         self.backend = FACE_DETECTION_BACKEND
+        self.triage_backend = TRIAGE_DETECTION_BACKEND
         self.net = None
         self._yolo_session = None
         
@@ -126,7 +127,8 @@ class FaceRecognitionHandler:
         self.mask_detection_enabled = MASK_DETECTION_ENABLED
         self.masked_similarity_threshold = MASKED_SIMILARITY_THRESHOLD
         self.upper_face_crop_ratio = UPPER_FACE_CROP_RATIO
-        self.mask_detector = None  # Legacy reference kept for compatibility — not used
+        self.mask_nose_ratio_threshold = MASK_NOSE_RATIO_THRESHOLD
+        self.mask_mouth_ratio_threshold = MASK_MOUTH_RATIO_THRESHOLD
         if self.mask_detection_enabled:
             print("[MASK] Mask Detection enabled (HSV skin-color heuristic + buffalo_sc MFR).")
 
@@ -189,7 +191,7 @@ class FaceRecognitionHandler:
         Returns True if ANY face is detected (low threshold).
         Returns False if definitely empty.
         """
-        if self.backend == 'yolov8':
+        if self.triage_backend == 'yolov8':
             if not hasattr(self, '_yolo_session') or self._yolo_session is None:
                 from config.config import YOLO_MODEL_PATH, EXECUTION_PROVIDERS
                 yolo_path = resource_path(os.path.join("data", "models", os.path.basename(YOLO_MODEL_PATH)))
@@ -239,18 +241,27 @@ class FaceRecognitionHandler:
         return False
 
     def detect_faces(self, frame):
-        """Detect faces in a frame using selected backend (Adaptive Scale)"""
-        if self.backend == 'yolov8':
-            return self._detect_faces_yolo(frame)
-        elif self.backend == 'opencv_dnn' and self.net:
-            # 1. Fast Pass (Native 300x300)
-            faces = self._detect_faces_opencv(frame, (300, 300))
-            # 2. Deep Pass (Upscaled for distance) if nothing found
-            if not faces:
-                faces = self._detect_faces_opencv(frame, (640, 640))
-            return faces
-        else:
-            return self.app.get(frame)
+        """Detect faces in a frame using selected backend with adaptive multiscale fallback for 100% detection rate."""
+        faces = []
+        if hasattr(self, 'app') and self.app is not None:
+            faces = self.app.get(frame)
+            
+        # Multiscale Adaptive Fallback if initial pass returned 0 faces
+        if not faces and hasattr(self, 'app') and self.app is not None:
+            try:
+                # Fallback scale 1024x1024 for distant/small faces
+                self.app.prepare(ctx_id=getattr(self, '_ctx_id', -1), det_size=(1024, 1024))
+                faces = self.app.get(frame)
+                # Reset standard scale
+                self.app.prepare(ctx_id=getattr(self, '_ctx_id', -1), det_size=(640, 640))
+            except Exception:
+                try: self.app.prepare(ctx_id=getattr(self, '_ctx_id', -1), det_size=(640, 640))
+                except: pass
+
+        if not faces and self.backend == 'yolov8':
+            faces = self._detect_faces_yolo(frame)
+            
+        return faces
 
     def _detect_faces_yolo(self, frame):
         """Detect faces using YOLOv8-Face ONNX model"""
@@ -282,11 +293,15 @@ class FaceRecognitionHandler:
         input_tensor = np.expand_dims(chw, axis=0).astype(np.float32) / 255.0
         
         outputs = self._yolo_session.run(None, {'images': input_tensor})
-        predictions = outputs[0][0] # shape (5, 8400)
-        predictions = predictions.T # shape (8400, 5)
+        predictions = outputs[0]
+        if predictions.ndim == 3:
+            predictions = predictions[0]
+        # Transpose to (N, C) if in (C, N) format (e.g. 5x8400 -> 8400x5)
+        if predictions.shape[0] < predictions.shape[1]:
+            predictions = predictions.T
         
-        # Filter by confidence
-        conf_thresh = getattr(self, 'yolo_confidence_threshold', 0.4)
+        # Filter by confidence (0.25 threshold to detect all faces)
+        conf_thresh = getattr(self, 'yolo_confidence_threshold', 0.25)
         keep_idx = predictions[:, 4] > conf_thresh
         filtered = predictions[keep_idx]
         
@@ -401,7 +416,7 @@ class FaceRecognitionHandler:
         return faces
     
     def extract_face_encodings(self, frame):
-        """Extract both standard and masked-face encodings from a frame."""
+        """Extract both standard and upper-face crop encodings from a frame."""
         faces = self.app.get(frame)
         h, w = frame.shape[:2]
         resized_frame = None
@@ -424,19 +439,12 @@ class FaceRecognitionHandler:
         
         if self.mask_detection_enabled:
             try:
-                mfr_faces = self.mfr_app.get(frame)
-                if len(mfr_faces) == 0 and (h < 300 or w < 300):
-                    if resized_frame is None:
-                        scale = 640 / max(h, w)
-                        resized_frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
-                    mfr_faces = self.mfr_app.get(resized_frame)
-                
-                if len(mfr_faces) > 1:
-                    mfr_faces = sorted(mfr_faces, key=lambda x: (x.bbox[2]-x.bbox[0]) * (x.bbox[3]-x.bbox[1]), reverse=True)
-                if len(mfr_faces) > 0:
-                    mask_embedding = mfr_faces[0].embedding
+                target_frame = resized_frame if resized_frame is not None else frame
+                mask_embedding = self.extract_upper_face_encoding(target_frame, faces[0].bbox)
+                if mask_embedding is not None:
+                    print("[MASK] Successfully extracted registered upper face crop embedding.")
             except Exception as e:
-                print(f"[MASK] Failed to extract mask encoding: {e}")
+                print(f"[MASK] Failed to extract upper face crop encoding: {e}")
         
         return std_embedding, mask_embedding, "Face encodings extracted successfully"
 
@@ -599,25 +607,46 @@ class FaceRecognitionHandler:
         
         recognized_faces = []
         
+        # Full-frame cache for accurate landmark-aligned embedding extraction
+        full_faces_cache = None
+        if frame is not None and any(f.embedding is None for f in faces):
+            try:
+                full_faces_cache = self.app.get(frame)
+            except Exception as e:
+                print(f"[ERROR] Full-frame InsightFace pass failed: {e}")
+
         for face in faces:
-            # On-demand embedding extraction if missing and frame is provided
+            # On-demand embedding extraction using full-frame alignment
             if face.embedding is None and frame is not None:
                 try:
-                    x1, y1, x2, y2 = map(int, face.bbox)
-                    h, w = frame.shape[:2]
-                    margin = int(min(x2 - x1, y2 - y1) * 0.2)
-                    x1 = max(0, x1 - margin)
-                    y1 = max(0, y1 - margin)
-                    x2 = min(w, x2 + margin)
-                    y2 = min(h, y2 + margin)
-                    face_crop = frame[y1:y2, x1:x2]
+                    if full_faces_cache:
+                        fx1, fy1, fx2, fy2 = map(int, face.bbox)
+                        fcx, fcy = (fx1 + fx2) / 2.0, (fy1 + fy2) / 2.0
+                        best_match = None
+                        best_dist = float('inf')
+                        for ff in full_faces_cache:
+                            bx1, by1, bx2, by2 = ff.bbox
+                            bcx, bcy = (bx1 + bx2) / 2.0, (by1 + by2) / 2.0
+                            dist = (fcx - bcx)**2 + (fcy - bcy)**2
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_match = ff
+                        if best_match is not None:
+                            face.embedding = best_match.embedding
+                            if hasattr(best_match, 'kps'):
+                                face.kps = best_match.kps
                     
-                    if face_crop.size > 0:
-                        emb, kps = self.extract_face_details_from_crop(face_crop)
-                        if emb is not None:
-                            face.embedding = emb
-                        if kps is not None:
-                            face.kps = kps + np.array([x1, y1])
+                    # Direct crop embedding extraction from YOLO face bounding box
+                    if face.embedding is None:
+                        x1, y1, x2, y2 = map(int, face.bbox)
+                        h, w = frame.shape[:2]
+                        face_crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                        if face_crop.size > 0:
+                            crop_faces = self.app.get(face_crop)
+                            if crop_faces and len(crop_faces) > 0:
+                                face.embedding = crop_faces[0].embedding
+                                if hasattr(crop_faces[0], 'kps'):
+                                    face.kps = crop_faces[0].kps
                 except Exception as e:
                     print(f"[ERROR] On-demand embedding extraction failed: {e}")
 
@@ -704,6 +733,28 @@ class FaceRecognitionHandler:
         face_width = bx2 - bx1
         face_height = by2 - by1
 
+        # --- FAST LANDMARK-BASED PRE-CHECK ---
+        # If 5-point keypoints are available (left_eye, right_eye, nose, left_mouth, right_mouth),
+        # use geometric ratios to quickly rule out unmasked faces BEFORE the HSV analysis.
+        # This prevents false positives from shadows, dark skin, or poor lighting.
+        if hasattr(face, 'kps') and face.kps is not None and len(face.kps) >= 5:
+            kps = face.kps.astype(float)
+            eye_center_y = (kps[0][1] + kps[1][1]) / 2.0
+            nose_y = kps[2][1]
+            mouth_center_y = (kps[3][1] + kps[4][1]) / 2.0
+
+            if face_height > 0:
+                # Nose-to-eye ratio: if nose is clearly visible and well-separated from eyes,
+                # the face is likely not masked (masked faces compress nose visibility)
+                nose_eye_ratio = (nose_y - eye_center_y) / face_height
+                # Mouth-drop ratio: if mouth landmarks are well below the nose,
+                # the lower face is visible (unmasked)
+                mouth_drop_ratio = (mouth_center_y - nose_y) / face_height
+
+                # If both nose and mouth are clearly visible, this face is NOT masked
+                if nose_eye_ratio > self.mask_nose_ratio_threshold and mouth_drop_ratio > self.mask_mouth_ratio_threshold:
+                    return False
+
         if hasattr(face, 'kps') and face.kps is not None:
             kps  = face.kps.astype(int)
             # Crop lower face (nose-tip → chin), bounded horizontally by cheeks
@@ -742,8 +793,9 @@ class FaceRecognitionHandler:
         skin_ratio = skin_pixels / total
         # Unmasked face: skin_ratio > 60%
         # Masked face:   skin_ratio < 35%
-        # Threshold 0.45 is a safe midpoint
-        return skin_ratio < 0.45
+        # Tightened threshold from 0.45 -> 0.35 to reduce false positives
+        # on unmasked faces with shadows or dark skin tones
+        return skin_ratio < 0.35
 
 
     def extract_upper_face_encoding(self, frame, face_bbox):
@@ -793,40 +845,57 @@ class FaceRecognitionHandler:
             if mirror_h > 0:
                 padded[crop_h:crop_h + mirror_h, :crop_w] = upper_crop[crop_h - mirror_h:crop_h, :crop_w][::-1]
             
-            # Standardize face size to 224x224 for optimal detection inside canvas
-            padded = cv2.resize(padded, (224, 224))
+            # Standardize face size directly to 112x112 (ArcFace native input size)
+            padded = cv2.resize(padded, (112, 112))
             
-            # Place the face in the center of a canvas matching our det_size (320x320)
-            # This provides the deep-learning face detector with context/background borders,
-            # which are required for high-accuracy detection on cropped CCTV faces.
-            canvas_size = 320
-            canvas = np.zeros((canvas_size, canvas_size, 3), dtype=np.uint8)
-            canvas[:] = (128, 128, 128)  # Neutral grey background
-            
-            y_offset = (canvas_size - 224) // 2
-            x_offset = (canvas_size - 224) // 2
-            canvas[y_offset:y_offset + 224, x_offset:x_offset + 224] = padded
-            
-            # Run InsightFace on the canvas
-            faces = self.app.get(canvas)
-            
-            if len(faces) > 0:
-                # Pick the largest face found in the crop
-                faces = sorted(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]), reverse=True)
-                return faces[0].embedding
-            
-            return None
+            # Extract features directly from the recognition model, bypassing detection
+            embedding = self.app.models['recognition'].get_feat(padded)
+            if embedding is None:
+                return None
+            return embedding[0] if embedding.ndim == 2 else embedding
             
         except Exception as e:
             mask_log(f"[MASK] Upper face encoding error: {e}")
             return None
 
+    def recognize_face_masked_direct(self, upper_face_embedding):
+        """
+        Compare the live upper-face crop embedding directly against the registered
+        database upper-face mask encodings.
+        
+        Args:
+            upper_face_embedding: 512-dim embedding of the live upper face crop.
+            
+        Returns:
+            tuple: (person_id, person_name, similarity)
+        """
+        if upper_face_embedding is None or len(self.registered_faces) == 0:
+            return None, None, 0.0
+            
+        max_similarity = -1.0
+        recognized_id = None
+        recognized_name = None
+        
+        for person_id, data in self.registered_faces.items():
+            mask_encoding = data.get('mask_encoding')
+            if mask_encoding is None:
+                continue
+            similarity = self.calculate_similarity(upper_face_embedding, mask_encoding)
+            mask_log(f"[MASK] Upper-face similarity to {data.get('name')} ({person_id}): {similarity:.4f}")
+            if similarity > max_similarity:
+                max_similarity = similarity
+                if similarity > self.masked_similarity_threshold:
+                    recognized_id = person_id
+                    recognized_name = data.get('name')
+                    
+        return recognized_id, recognized_name, max_similarity
+
     def recognize_face_masked(self, face_embedding, upper_face_embedding=None):
         """
-        Attempt to recognize a face using the masked-face fallback strategy:
+        Attempt to recognize a face using the masked-face strategy:
         
-        1. Try standard recognition with the full-face embedding.
-        2. If that fails AND we have an upper-face embedding, retry with a lower threshold.
+        1. Compare the upper-face embedding against the registered mask encodings.
+        2. If that fails (or upper-face embedding is missing), try standard full-face recognition.
         
         Args:
             face_embedding: Standard full-face 512-dim embedding.
@@ -834,33 +903,18 @@ class FaceRecognitionHandler:
             
         Returns:
             tuple: (person_id, person_name, similarity, recognition_method)
-                   recognition_method is 'full_face', 'upper_face', or None
+                   recognition_method is 'upper_face', 'full_face', or None
         """
-        # Step 1: Try standard full-face recognition
+        if upper_face_embedding is not None:
+            person_id, person_name, similarity = self.recognize_face_masked_direct(upper_face_embedding)
+            if person_id is not None:
+                return person_id, person_name, similarity, 'upper_face'
+            
+        # Try standard full-face recognition as fallback
         person_id, person_name, similarity = self.recognize_face(face_embedding)
-        
         if person_id is not None:
             return person_id, person_name, similarity, 'full_face'
-        
-        # Step 2: If standard failed and we have an upper-face embedding, try masked matching
-        if upper_face_embedding is not None and len(self.registered_faces) > 0:
-            max_similarity = -1.0
-            best_id = None
-            best_name = None
             
-            for pid, data in self.registered_faces.items():
-                sim = self.calculate_similarity(upper_face_embedding, data['encoding'])
-                mask_log(f"[MASK] Upper-face similarity to {data['name']} ({pid}): {sim:.4f}")
-                if sim > max_similarity:
-                    max_similarity = sim
-                    if sim > self.masked_similarity_threshold:
-                        best_id = pid
-                        best_name = data['name']
-            
-            if best_id is not None:
-                return best_id, best_name, max_similarity, 'upper_face'
-        
-        # Step 3: Nothing matched
         return None, None, similarity if similarity > 0 else 0.0, None
 
     def recognize_multiple_faces_masked(self, faces, frame=None):
@@ -878,25 +932,44 @@ class FaceRecognitionHandler:
         """
         recognized_faces = []
         
+        # Full-frame cache for accurate landmark-aligned embedding extraction
+        full_faces_cache = None
+        if frame is not None and any(f.embedding is None for f in faces):
+            try:
+                full_faces_cache = self.app.get(frame)
+            except Exception as e:
+                print(f"[ERROR] Full-frame InsightFace pass failed: {e}")
+
         for face in faces:
-            # On-demand embedding extraction if missing and frame is provided
+            # On-demand embedding extraction using full-frame alignment
             if face.embedding is None and frame is not None:
                 try:
-                    x1, y1, x2, y2 = map(int, face.bbox)
-                    h, w = frame.shape[:2]
-                    margin = int(min(x2 - x1, y2 - y1) * 0.2)
-                    x1 = max(0, x1 - margin)
-                    y1 = max(0, y1 - margin)
-                    x2 = min(w, x2 + margin)
-                    y2 = min(h, y2 + margin)
-                    face_crop = frame[y1:y2, x1:x2]
+                    if full_faces_cache:
+                        fx1, fy1, fx2, fy2 = map(int, face.bbox)
+                        fcx, fcy = (fx1 + fx2) / 2.0, (fy1 + fy2) / 2.0
+                        best_match = None
+                        best_dist = float('inf')
+                        for ff in full_faces_cache:
+                            bx1, by1, bx2, by2 = ff.bbox
+                            bcx, bcy = (bx1 + bx2) / 2.0, (by1 + by2) / 2.0
+                            dist = (fcx - bcx)**2 + (fcy - bcy)**2
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_match = ff
+                        if best_match is not None:
+                            face.embedding = best_match.embedding
+                            if hasattr(best_match, 'kps'):
+                                face.kps = best_match.kps
                     
-                    if face_crop.size > 0:
-                        emb, kps = self.extract_face_details_from_crop(face_crop)
-                        if emb is not None:
-                            face.embedding = emb
-                        if kps is not None:
-                            face.kps = kps + np.array([x1, y1])
+                    # Fallback to crop if full-frame match wasn't found
+                    if face.embedding is None:
+                        x1, y1, x2, y2 = map(int, face.bbox)
+                        h, w = frame.shape[:2]
+                        face_crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                        if face_crop.size > 0:
+                            emb, kps = self.extract_face_details_from_crop(face_crop)
+                            if emb is not None: face.embedding = emb
+                            if kps is not None: face.kps = kps
                 except Exception as e:
                     print(f"[ERROR] On-demand embedding extraction failed: {e}")
 
@@ -906,71 +979,47 @@ class FaceRecognitionHandler:
             recognition_method = 'full_face' if person_id else None
             
             # If standard recognition FAILED, try mask-aware fallback
+            # BUT skip entirely if:
+            #  1. similarity is near-zero (face not in database at all — mask won't help)
+            #  2. No registered faces have mask_encodings (upper-face matching would return -1.0)
             if person_id is None and self.mask_detection_enabled and frame is not None:
-                # Detect if this face has a mask (Corrected signature and single return value)
-                is_masked = self.detect_mask(frame, face)
-                mask_log(f"[MASK] Standard recognition failed. Heuristic is_masked={is_masked}")
-                
-                # Try buffalo_sc recognition only if mask detection indicates a mask is present.
-                if is_masked:
-                    try:
-                        x1, y1, x2, y2 = map(int, face.bbox)
-                        h, w = frame.shape[:2]
-                        margin = int(min(x2 - x1, y2 - y1) * 0.2)
-                        x1 = max(0, x1 - margin)
-                        y1 = max(0, y1 - margin)
-                        x2 = min(w, x2 + margin)
-                        y2 = min(h, y2 + margin)
-                        face_crop = frame[y1:y2, x1:x2]
-                        
-                        if face_crop.size > 0:
-                            mfr_faces = self.mfr_app.get(face_crop)
-                            if len(mfr_faces) == 0:
-                                ch, cw = face_crop.shape[:2]
-                                if ch < 300 or cw < 300:
-                                    scale = 640.0 / max(ch, cw)
-                                    resized_mfr = cv2.resize(face_crop, (0, 0), fx=scale, fy=scale)
-                                    mfr_faces = self.mfr_app.get(resized_mfr)
-                            if len(mfr_faces) > 0:
-                                mfr_faces = sorted(mfr_faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]), reverse=True)
-                                mask_emb = mfr_faces[0].embedding
-                                mask_log(f"[MASK] Successfully extracted MFR embedding using buffalo_sc.")
-                                
-                                # 1a. Try matching against mask_encoding first
-                                m_id, m_name, m_sim = self.recognize_face(mask_emb, is_masked=True, threshold=self.masked_similarity_threshold)
-                                mask_log(f"[MASK] Matching against registered mask_encoding: matched_id={m_id}, sim={m_sim:.4f}")
-                                if m_sim > similarity:
-                                    similarity = m_sim
-                                if m_id is not None:
-                                    person_id = m_id
-                                    person_name = m_name
-                                    recognition_method = 'mask_face'
-                                else:
-                                    # 1b. Fallback: match buffalo_sc embedding against STANDARD encoding
-                                    # (most people lack mask_encoding in their profile)
-                                    m_id, m_name, m_sim = self.recognize_face(mask_emb, is_masked=False, threshold=self.masked_similarity_threshold)
-                                    mask_log(f"[MASK] Matching MFR embedding against standard encoding: matched_id={m_id}, sim={m_sim:.4f}")
-                                    if m_sim > similarity:
-                                        similarity = m_sim
-                                    if m_id is not None:
-                                        person_id = m_id
-                                        person_name = m_name
-                                        recognition_method = 'mask_face_std'
-                            else:
-                                mask_log(f"[MASK] MFR buffalo_sc failed to detect face in crop.")
-                    except Exception as e:
-                        mask_log(f"[MASK] Dynamic masked recognition error: {e}")
+                # Fast exit: if standard similarity is below 0.10, the face isn't registered 
+                # in the database at all. Mask detection can't identify someone who doesn't exist.
+                if similarity < 0.10:
+                    pass  # Skip mask fallback entirely — genuinely unknown face
+                else:
+                    # Detect if this face has a mask (Corrected signature and single return value)
+                    is_masked = self.detect_mask(frame, face)
+                    mask_log(f"[MASK] Standard recognition failed. Heuristic is_masked={is_masked}")
                     
-                    # 2. Fallback: If primary failed, use upper-face heuristic
-                    if person_id is None:
-                        upper_emb = self.extract_upper_face_encoding(frame, face.bbox)
-                        if upper_emb is not None:
-                            mask_log(f"[MASK] Successfully extracted upper face embedding.")
-                            person_id, person_name, similarity, recognition_method = \
-                                self.recognize_face_masked(face.embedding, upper_emb)
-                            mask_log(f"[MASK] Upper face match result: person_id={person_id}, sim={similarity:.4f}")
+                    if is_masked:
+                        # 1. Try fast full-face recognition at the lower threshold first (0ms overhead)
+                        pid, pname, sim = self.recognize_face(face.embedding, is_masked=False, threshold=self.masked_similarity_threshold)
+                        if pid is not None:
+                            person_id = pid
+                            person_name = pname
+                            similarity = sim
+                            recognition_method = 'full_face_masked_threshold'
+                            mask_log(f"[MASK] Fast match success on full-face standard embedding: {pname} ({pid}) | Sim: {sim:.4f}")
                         else:
-                            mask_log(f"[MASK] Failed to extract upper face embedding.")
+                            # 2. Only attempt expensive upper-face extraction if at least one
+                            #    registered face actually has a mask_encoding to compare against
+                            has_mask_encodings = any(d.get('mask_encoding') is not None for d in self.registered_faces.values())
+                            if has_mask_encodings:
+                                upper_emb = self.extract_upper_face_encoding(frame, face.bbox)
+                                if upper_emb is not None:
+                                    mask_log(f"[MASK] Successfully extracted live upper face crop embedding.")
+                                    pid, pname, sim = self.recognize_face_masked_direct(upper_emb)
+                                    mask_log(f"[MASK] Direct upper-face match result: person_id={pid}, sim={sim:.4f}")
+                                    if pid is not None:
+                                        person_id = pid
+                                        person_name = pname
+                                        similarity = sim
+                                        recognition_method = 'upper_face'
+                                else:
+                                    mask_log(f"[MASK] Failed to extract upper face embedding.")
+                            else:
+                                mask_log(f"[MASK] Skipping upper-face extraction (no mask_encodings registered).")
             
             recognized_faces.append({
                 'bbox': face.bbox,

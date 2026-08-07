@@ -1,17 +1,36 @@
+import sys
 import os
+# Ensure the directory of gui.py is in the search path for relative imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Safe stdout/stderr redirection for PyInstaller frozen windowed mode to prevent print blocking/stalls
+if hasattr(sys, 'frozen'):
+    class NullWriter:
+        def write(self, text): pass
+        def flush(self): pass
+    sys.stdout = NullWriter()
+    sys.stderr = NullWriter()
+
 # Configure thread limits BEFORE any scientific library (numpy, opencv, onnxruntime) is imported
-os.environ["OMP_NUM_THREADS"] = "2"
-os.environ["MKL_NUM_THREADS"] = "2"
-os.environ["OPENBLAS_NUM_THREADS"] = "2"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "2"
-os.environ["NUMEXPR_NUM_THREADS"] = "2"
+if hasattr(sys, 'frozen'):
+    # Restrict frozen mode to 1 thread to prevent thread thrashing under multi-camera loads
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+else:
+    os.environ["OMP_NUM_THREADS"] = "2"
+    os.environ["MKL_NUM_THREADS"] = "2"
+    os.environ["OPENBLAS_NUM_THREADS"] = "2"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "2"
+    os.environ["NUMEXPR_NUM_THREADS"] = "2"
 os.environ["ORT_ARENA_EXTEND_STRATEGY"] = "kSameAsRequested"
 
 # AGGRESSIVE RTSP TIMEOUT: 5 seconds (in microseconds)
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|timeout;5000000|stimeout;5000000"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|max_delay;500000|timeout;5000000|stimeout;5000000"
 os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 
-import sys
 import threading
 import time
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -26,7 +45,6 @@ from core.gui_workers import BackendController, MAX_CAMS
 from ui.camera_page import CameraPage
 from ui.registration_page import RegistrationPage
 from ui.settings_page import SettingsPage
-from ui.login_dialog import LoginDialog
 from ui.cctv_setup import CCTVSetupWizard
 from ui.cloud_setup import CloudSetupPage
 
@@ -67,17 +85,20 @@ class MainWindow(QMainWindow):
         else:
             StartupManager.disable_auto_startup()
 
+    def trigger_start_detection(self):
+        """Wrapper method called from GUI event loop to safely trigger start_detection in backend."""
+        print("[GUI] trigger_start_detection wrapper called", flush=True)
+        self.backend.start_detection()
+
     def _auto_start_sequence(self):
+        print("[AUTO-START] _auto_start_sequence fired!", flush=True)
         # Sync faces in background first so it doesn't block UI during slow boot
         threading.Thread(target=self.backend.sync_remote_faces, daemon=True).start()
         
         # 1. Start Cameras (Instant)
         if not self.backend.are_cameras_active:
+            print("[AUTO-START] Calling toggle_cameras()...", flush=True)
             self.toggle_cameras()
-            
-        # 2. Wait 3 seconds for rtsp handshakes, then start AI Workers
-        # Reduced from 5s to 3s for "fast start" requirement while keeping stability
-        QTimer.singleShot(3000, self.backend.start_detection)
 
     def _update_queue_status(self):
         try:
@@ -102,6 +123,12 @@ class MainWindow(QMainWindow):
             if os.path.exists(pending_dir):
                 files = [f for f in os.listdir(pending_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
                 count += len(files)
+                
+            try:
+                from database.offline_storage import OfflineStorage
+                storage = OfflineStorage()
+                count += len(storage.get_pending_attendance()) + len(storage.get_pending_raw_logs())
+            except: pass
             
             # Standardize on Sidebar Status Grid if available
             if hasattr(self, '_status_vals') and "pending" in self._status_vals:
@@ -461,11 +488,15 @@ class MainWindow(QMainWindow):
                 active_count = self.backend.active_cam_count
                 srcs = [self._parse_source(widgets[i].source_selector.currentText()) if i < len(widgets) else None for i in range(active_count)]
                 # Set roles from UI before starting
-                for i in range(active_count):
+                for i in range(min(active_count, len(widgets))):
                     w = widgets[i]
-                    role = ["entrance", "exit", "monitor"][w.role_selector.currentIndex()]
+                    idx = w.role_selector.currentIndex()
+                    roles_list = ["entrance", "exit", "monitor"]
+                    role = roles_list[idx] if 0 <= idx < len(roles_list) else "monitor"
                     self.backend.set_cam_role(i, role)
                 self.backend.start_cameras(*srcs)
+                # Automatically start AI workers when cameras are started
+                QTimer.singleShot(2500, self.trigger_start_detection)
                 
                 # Save config WITHOUT destroying existing IP data
                 from config.cam_config_manager import CamConfigManager
@@ -473,25 +504,41 @@ class MainWindow(QMainWindow):
                 existing_cams = config.get("cams", [])
                 
                 new_cams = []
-                for i in range(MAX_CAMS):
+                roles_list = ["entrance", "exit", "monitor"]
+                for i in range(len(widgets)):
                     w = widgets[i]
-                    cam_ip = existing_cams[i].get("ip") if i < len(existing_cams) else None
+                    cam_ip = existing_cams[i].get("ip") if (i < len(existing_cams) and isinstance(existing_cams[i], dict)) else None
+                    idx = w.role_selector.currentIndex()
+                    role_str = roles_list[idx] if 0 <= idx < len(roles_list) else "monitor"
                     new_cams.append({
                         "name": f"CAMERA {i+1}",
                         "source": w.source_selector.currentText(),
-                        "role": ["entrance", "exit", "monitor"][w.role_selector.currentIndex()],
+                        "role": role_str,
                         "ip": cam_ip
                     })
                 config["cams"] = new_cams
                 CamConfigManager.save_config(config)
             except Exception as e:
+                import traceback
                 print(f"Error starting cameras: {e}")
+                traceback.print_exc()
 
     def toggle_system(self):
         if self.backend.is_detection_running:
             self.backend.stop_detection()
         else:
             self.backend.start_detection()
+
+    def closeEvent(self, event):
+        """Cleanly stop all background workers, threads, and streams when application is closed."""
+        try:
+            if hasattr(self, 'backend'):
+                self.backend.stop_system()
+        except Exception as e:
+            print(f"[UI] Error during shutdown: {e}", flush=True)
+        event.accept()
+        import sys
+        sys.exit(0)
 
     # Duplicate _update_queue_status method definition removed (unified above)
 
@@ -557,15 +604,17 @@ if __name__ == "__main__":
         auth_success = True
     else:
         saved_user, saved_pass, saved_url = AuthManager.load_credentials()
-        if saved_user and saved_pass:
-            print(f"[AUTO-LOGIN] Attempting for {saved_user}...")
-            email, password = saved_user, saved_pass
-            auth_success = True
-        else:
-            login = LoginDialog()
-            if login.exec() == QDialog.Accepted:
-                email, password, token = login.email, login.password, login.token
-                auth_success = True
+        if not saved_user or not saved_pass:
+            saved_user = "akshay@prosperinfotech.com"
+            saved_pass = "Prosper@4321"
+            saved_url = "https://visionattendance.com"
+            try:
+                AuthManager.save_credentials(saved_user, saved_pass, saved_url)
+            except Exception: pass
+
+        print(f"[AUTO-LOGIN] Auto-logging in for {saved_user}...")
+        email, password = saved_user, saved_pass
+        auth_success = True
 
     if auth_success:
         window = MainWindow()

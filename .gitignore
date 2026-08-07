@@ -48,7 +48,14 @@ data/
 # Logs and Reports
 exports/
 *.log
+out.txt
 
 # Installer output
 Output/
 *.exe
+
+# Temporary scratch files
+scratch/
+.pytest_cache/
+.coverage
+htmlcov/
