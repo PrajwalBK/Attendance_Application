@@ -1,71 +1,158 @@
 # -*- mode: python ; coding: utf-8 -*-
-import os
 import sys
-from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules, collect_data_files
+import os
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules, collect_dynamic_libs
 
 block_cipher = None
 
-# Collect ONNX Runtime DLLs (excluding OpenVINO provider to prevent DLL version mismatch popups)
-binaries = []
-for path, dest in collect_dynamic_libs('onnxruntime'):
-    if 'openvino' not in os.path.basename(path).lower():
-        binaries.append((path, dest))
-    else:
-        print(f"[SPEC] Excluded OpenVINO provider: {path}")
+# Collect dynamic libraries and data assets for onnxruntime, insightface, qtawesome, and qt_material
+onnx_datas = collect_data_files('onnxruntime')
+onnx_binaries = collect_dynamic_libs('onnxruntime')
+insightface_datas = collect_data_files('insightface')
 
-# [DLL FIX] Add OpenCV FFMPEG DLL to the root so Windows LoadLibrary can find it
-import cv2
-cv2_dir = os.path.dirname(cv2.__file__)
-for f in os.listdir(cv2_dir):
-    if 'ffmpeg' in f.lower() and f.endswith('.dll'):
-        binaries.append((os.path.join(cv2_dir, f), '.'))
-        print(f"[SPEC] Added OpenCV FFMPEG DLL: {f}")
+qtawesome_datas = collect_data_files('qtawesome')
+qtmaterial_datas = collect_data_files('qt_material')
+matplotlib_datas = collect_data_files('matplotlib')
 
-# Collect hidden imports for AI libraries
-hidden_imports = (
-    collect_submodules('insightface') +
-    collect_submodules('skimage') +
-    collect_submodules('sklearn') +
-    collect_submodules('onnxruntime') +
-    collect_submodules('supervision') +
-    collect_submodules('qt_material') +
-    [
-        'PySide6.QtPrintSupport',
-        'qtawesome.iconic_font',
-        'cv2',
-        'numpy',
-        'PIL',
-        'mysql.connector',
-        'requests',
-        'scipy.special.cython_special',
-        'scipy.linalg.cython_blas',
-        'scipy.linalg.cython_lapack',
-        'onnxruntime.capi.onnxruntime_pybind11_state'
-    ]
+# Collect skimage and lazy_loader with .pyi stub files (fixes ValueError: Cannot load imports from non-existent stub)
+skimage_datas = collect_data_files('skimage', include_py_files=True)
+lazy_loader_datas = collect_data_files('lazy_loader', include_py_files=True)
+albumentations_datas = collect_data_files('albumentations', include_py_files=True)
+
+# Collect OpenVINO if present in the environment
+try:
+    openvino_datas = collect_data_files('openvino')
+    openvino_binaries = collect_dynamic_libs('openvino')
+except Exception:
+    openvino_datas = []
+    openvino_binaries = []
+
+# Project folders and data dependencies (dynamically checked)
+added_datas = []
+for folder in ['models', 'data/models', 'data', 'config', 'core', 'ui', 'database', 'assets', 'icons']:
+    if os.path.exists(folder):
+        added_datas.append((folder, folder))
+
+added_datas += (
+    onnx_datas
+    + insightface_datas
+    + qtawesome_datas
+    + qtmaterial_datas
+    + matplotlib_datas
+    + skimage_datas
+    + lazy_loader_datas
+    + albumentations_datas
+    + openvino_datas
 )
+added_binaries = onnx_binaries + openvino_binaries
 
-# Collect data files (Models, Icons, etc.)
-added_files = [
-    ('ui', 'ui'),
-    ('config', 'config'),
-    ('data/models', 'data/models'),
-    ('database', 'database'),
-    ('README.md', '.'),
-]
-added_files += collect_data_files('qtawesome')
-added_files += collect_data_files('insightface')
-added_files += collect_data_files('qt_material')
+hidden_imports = [
+    'insightface',
+    'insightface.model_zoo',
+    'insightface.app',
+    'insightface.utils',
+    'insightface.data',
+    'onnxruntime',
+    'onnxruntime.capi._pybind_state',
+    'multiprocessing',
+    'multiprocessing.popen_spawn_win32',
+    'PySide6',
+    'PySide6.QtCore',
+    'PySide6.QtGui',
+    'PySide6.QtWidgets',
+    'PySide6.QtNetwork',
+    'PySide6.QtSvg',
+    'qtawesome',
+    'qt_material',
+    'matplotlib',
+    'matplotlib.pyplot',
+    'skimage',
+    'skimage.transform',
+    'skimage.filters',
+    'skimage.draw',
+    'skimage.color',
+    'skimage.exposure',
+    'skimage.feature',
+    'skimage.io',
+    'skimage.measure',
+    'skimage.metrics',
+    'skimage.morphology',
+    'skimage.restoration',
+    'skimage.segmentation',
+    'skimage.util',
+    'lazy_loader',
+    'albumentations',
+    'albucore',
+    'supervision',
+    'scipy',
+    'scipy.spatial',
+    'scipy.signal',
+    'sklearn',
+    'cv2',
+    'numpy',
+    'PIL',
+    'requests',
+    'urllib3',
+    'sqlite3',
+    'mysql',
+    'mysql.connector',
+    'pymysql',
+    'pyttsx3',
+    'reportlab',
+    'core',
+    'core.camera',
+    'core.face_recognition',
+    'core.multiprocess_handler',
+    'core.gui_workers',
+    'core.snapshot_manager',
+    'core.track_manager',
+    'core.tracker',
+    'core.api_client',
+    'core.frame_buffer',
+    'core.voice_handler',
+    'core.recorder',
+    'core.attendance_tracker',
+    'core.registration',
+    'core.mask_detector',
+    'core.video_processor',
+    'core.utils',
+    'core.startup_manager',
+    'database',
+    'database.database',
+    'database.offline_storage',
+    'config',
+    'config.config',
+    'config.auth_manager',
+    'config.cam_config_manager',
+    'config.db_config_manager',
+    'ui',
+    'ui.camera_page',
+    'ui.cctv_setup',
+    'ui.cloud_setup',
+    'ui.records_page',
+    'ui.registration_page',
+    'ui.settings_page',
+    'ui.theme_manager',
+] + (
+    collect_submodules('insightface')
+    + collect_submodules('qtawesome')
+    + collect_submodules('qt_material')
+    + collect_submodules('skimage')
+    + collect_submodules('lazy_loader')
+    + collect_submodules('albumentations')
+    + collect_submodules('supervision')
+)
 
 a = Analysis(
     ['gui.py'],
-    pathex=[],
-    binaries=binaries,
-    datas=added_files,
+    pathex=['.', os.path.abspath('.')],
+    binaries=added_binaries,
+    datas=added_datas,
     hiddenimports=hidden_imports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['tkinter', 'tcl', 'tk'],
+    excludes=['tkinter', 'notebook', 'PyQt5'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -86,11 +173,10 @@ exe = EXE(
     upx=True,
     console=False,
     disable_windowed_traceback=False,
-    argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    contents_directory='.'
+    icon='assets/icon.ico' if os.path.exists('assets/icon.ico') else None,
 )
 
 coll = COLLECT(
@@ -101,21 +187,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='VisionAttendance'
+    name='VisionAttendance',
 )
-
-# [POST-BUILD DLL COPY] Copy FFMPEG DLL to the root directory to guarantee it's found by LoadLibrary
-try:
-    import shutil
-    for folder in ['VisionAttendance', 'VisionAttendanceYolo4']:
-        dist_dir = os.path.join('dist', folder)
-        cv2_dir_in_dist = os.path.join(dist_dir, 'cv2')
-        if os.path.exists(cv2_dir_in_dist):
-            for f in os.listdir(cv2_dir_in_dist):
-                if 'ffmpeg' in f.lower() and f.endswith('.dll'):
-                    src_dll = os.path.join(cv2_dir_in_dist, f)
-                    dst_dll = os.path.join(dist_dir, f)
-                    shutil.copy2(src_dll, dst_dll)
-                    print(f"\n[POST-BUILD SUCCESS] Copied FFMPEG DLL to root: {dst_dll}\n")
-except Exception as post_err:
-    print(f"\n[POST-BUILD ERROR] Failed to copy FFMPEG DLL to root: {post_err}\n")

@@ -1,64 +1,52 @@
 @echo off
-setlocal enabledelayedexpansion
+title Building Vision Attendance Executable
+echo =========================================================
+echo    Vision Attendance System - Building Standalone EXE
+echo =========================================================
 
-echo ============================================================
-echo   Vision Attendance System - Build Script
-echo ============================================================
-
-:: 1. Setup Environment
-echo [1/4] Activating Virtual Environment...
-if not exist "venv" (
-    echo Error: venv directory not found!
-    exit /b 1
+:: 1. Detect and Activate Virtual Environment
+if exist "..\venv\Scripts\activate.bat" (
+    call ..\venv\Scripts\activate.bat
+    echo [INFO] Activated virtual environment: ..\venv
+) else if exist "venv\Scripts\activate.bat" (
+    call venv\Scripts\activate.bat
+    echo [INFO] Activated virtual environment: venv
+) else if exist ".venv\Scripts\activate.bat" (
+    call .venv\Scripts\activate.bat
+    echo [INFO] Activated virtual environment: .venv
+) else if exist "env\Scripts\activate.bat" (
+    call env\Scripts\activate.bat
+    echo [INFO] Activated virtual environment: env
+) else (
+    echo [INFO] Using current active Python environment.
 )
 
-:: Clean old build artifacts
-if exist "build" rmdir /s /q "build"
-if exist "dist" rmdir /s /q "dist"
+:: 2. Clean old build outputs
+echo [INFO] Cleaning previous builds...
+if exist build ( rmdir /s /q build )
+if exist dist\VisionAttendance ( rmdir /s /q dist\VisionAttendance )
 
-:: 2. PyInstaller Build
-echo [2/4] Running PyInstaller (Clean Build)...
-.\venv\Scripts\python -m PyInstaller vision_attendance.spec --noconfirm
+:: 3. Run PyInstaller via Python Module
+echo [INFO] Running PyInstaller compilation on vision_attendance.spec...
+python -m PyInstaller vision_attendance.spec --clean --noconfirm
 
 if %ERRORLEVEL% NEQ 0 (
-    echo Error: PyInstaller build failed!
+    echo.
+    echo [ERROR] Build failed! Check the error log above.
+    pause
     exit /b %ERRORLEVEL%
 )
 
-echo.
-echo [3/4] Searching for Inno Setup Compiler (ISCC)...
-
-:: Search paths for ISCC.exe
-set "ISCC_PATH="
-for %%P in (
-    "C:\Inno Setup 7\ISCC.exe"
-    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-    "C:\Program Files\Inno Setup 6\ISCC.exe"
-    "%LocalAppData%\Programs\Inno Setup 6\ISCC.exe"
-) do (
-    if exist "%%~P" set "ISCC_PATH=%%~P"
-)
-
-if "!ISCC_PATH!"=="" (
-    echo.
-    echo WARNING: ISCC.exe not found in standard paths.
-    echo Please compile 'installer.iss' manually using Inno Setup.
-) else (
-    echo Found ISCC at: !ISCC_PATH!
-    echo [4/4] Compiling Installer...
-    "!ISCC_PATH!" installer.iss
-    
-    if !ERRORLEVEL! EQU 0 (
-        echo.
-        echo SUCCESS: VisionAttendance_Setup.exe has been generated!
-    ) else (
-        echo.
-        echo Error: Inno Setup compilation failed!
-    )
-)
+:: 4. Ensure data directory structure exists in dist folder
+echo [INFO] Finalizing runtime folder structure in dist\VisionAttendance...
+if not exist dist\VisionAttendance\data ( mkdir dist\VisionAttendance\data )
+if not exist dist\VisionAttendance\data\pending_snapshots ( mkdir dist\VisionAttendance\data\pending_snapshots )
+if not exist dist\VisionAttendance\data\temp_recordings ( mkdir dist\VisionAttendance\data\temp_recordings )
 
 echo.
-echo ============================================================
-echo   Build process complete.
-echo ============================================================
+echo =========================================================
+echo    BUILD SUCCESSFUL!
+echo    Executable ready at: dist\VisionAttendance\VisionAttendance.exe
+echo =========================================================
 pause
+

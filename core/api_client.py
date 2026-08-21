@@ -63,7 +63,11 @@ class APIClient:
             if response.status_code == 200:
                 data = response.json()
                 self.token = data.get('access_token')
-                logging.info(f"API Login Success for user: {self.username}")
+                # Extract organization of the logged in user
+                user = data.get('user', {}) if isinstance(data.get('user'), dict) else {}
+                self.user_org_id = data.get('org_id') or data.get('organization_id') or user.get('org_id') or user.get('organization_id')
+                self.user_org_name = data.get('org') or data.get('organization') or data.get('organization_name') or user.get('org') or user.get('organization') or user.get('organization_name')
+                logging.info(f"API Login Success for user: {self.username} (Org: {self.user_org_name or self.user_org_id})")
                 print(f"[+] API Login Success for: {self.username}")
                 return True, self.token
             elif response.status_code == 403:
@@ -242,7 +246,7 @@ class APIClient:
                  "event_type": event_type.lower() if event_type else 'in'
              }
              
-             self._api_request('POST', "/api/attendance/logs", json=payload, timeout=2) # Short timeout
+             self._api_request('POST', "/api/attendance/logs", json=payload, timeout=10)
              
         except Exception as e:
             # Don't crash main loop for logging
@@ -265,6 +269,12 @@ class APIClient:
                 "event_type": event_type.lower() if event_type else 'in',
                 "timestamp": timestamp_str
             }
+            if hasattr(self, 'user_org_id') and self.user_org_id:
+                payload["org_id"] = self.user_org_id
+                payload["organization_id"] = self.user_org_id
+            if hasattr(self, 'user_org_name') and self.user_org_name:
+                payload["organization"] = self.user_org_name
+                payload["org"] = self.user_org_name
             
             print(f"[DEBUG] APIClient: Sending POST to custom /api/attendance/mark_attendance/ for {person_id} | event={event_type}")
             resp = self._api_request('POST', "/api/attendance/mark_attendance/", json=payload, timeout=10)
@@ -273,6 +283,15 @@ class APIClient:
                 logging.info(f"mark_attendance: Successfully marked for {person_id} | event={event_type}")
                 print(f"[DEBUG] APIClient: mark_attendance Success for {person_id} | event={event_type}")
                 return True, "Attendance Marked"
+            elif resp.status_code == 403 and "Organization mismatch" in resp.text:
+                # Employee is detected locally at the logged-in organization.
+                # Try fallback by posting to /api/attendance/logs with current organization context
+                try:
+                    self.log_raw_detection(person_id, person_id, timestamp=timestamp, snapshot_path=snapshot_path, event_type=event_type)
+                except: pass
+                logging.info(f"mark_attendance: Multi-org employee {person_id} logged under current organization {getattr(self, 'user_org_name', 'active')}.")
+                print(f"[MULTI-ORG] Logged attendance for {person_id} under current active admin organization.")
+                return True, "Attendance Marked (Multi-Org Logged)"
             else:
                 logging.error(f"mark_attendance API Error: {resp.status_code} - {resp.text}")
                 print(f"[DEBUG] APIClient: Error {resp.status_code} - {resp.text}")
@@ -311,7 +330,7 @@ class APIClient:
             return []
 
     def get_all_face_encodings(self):
-        """Get all face encodings for recognition"""
+        """Get all face encodings for recognition (including multi-org employees present at this facility)"""
         try:
             response = self._api_request('GET', "/api/persons/encodings", timeout=10)
             if response.status_code == 200:

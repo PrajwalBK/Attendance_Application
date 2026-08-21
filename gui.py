@@ -3,13 +3,38 @@ import os
 # Ensure the directory of gui.py is in the search path for relative imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Safe stdout/stderr redirection for PyInstaller frozen windowed mode to prevent print blocking/stalls
+# Safe stdout/stderr redirection and crash logging for PyInstaller frozen mode
 if hasattr(sys, 'frozen'):
-    class NullWriter:
-        def write(self, text): pass
-        def flush(self): pass
-    sys.stdout = NullWriter()
-    sys.stderr = NullWriter()
+    # Ensure logs directory exists
+    _base_dir = os.path.dirname(sys.executable)
+    _logs_dir = os.path.join(_base_dir, "logs")
+    try:
+        os.makedirs(_logs_dir, exist_ok=True)
+    except Exception:
+        pass
+
+    # Exception hook to write uncaught crashes to crash.log
+    import traceback
+    def _exception_handler(exc_type, exc_value, exc_traceback):
+        try:
+            crash_path = os.path.join(_logs_dir, "crash.log")
+            with open(crash_path, "a", encoding="utf-8") as f:
+                traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
+        except Exception:
+            pass
+        if sys.__stderr__:
+            traceback.print_exception(exc_type, exc_value, exc_traceback, file=sys.__stderr__)
+
+    sys.excepthook = _exception_handler
+
+    # Only replace stdout/stderr with NullWriter if running without a console
+    if sys.stdout is None:
+        class NullWriter:
+            def write(self, text): pass
+            def flush(self): pass
+        sys.stdout = NullWriter()
+    if sys.stderr is None:
+        sys.stderr = NullWriter()
 
 # Configure thread limits BEFORE any scientific library (numpy, opencv, onnxruntime) is imported
 if hasattr(sys, 'frozen'):
@@ -37,7 +62,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QStackedWidget,
                              QFrame, QDialog, QGridLayout, QSpacerItem, QSizePolicy, QComboBox)
 from PySide6.QtCore import Qt, QSize, QTimer
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QPixmap, QIcon
 
 import qtawesome as qta
 from ui.theme_manager import ThemeManager
@@ -55,6 +80,15 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("Vision Attendance System")
         self.setMinimumSize(800, 600)
+
+        # Set Window and Taskbar Icon
+        _app_dir = os.path.dirname(os.path.abspath(__file__))
+        _icon_png = os.path.join(_app_dir, "assets", "icon.png")
+        _icon_ico = os.path.join(_app_dir, "assets", "icon.ico")
+        if os.path.exists(_icon_png):
+            self.setWindowIcon(QIcon(_icon_png))
+        elif os.path.exists(_icon_ico):
+            self.setWindowIcon(QIcon(_icon_ico))
 
         self.backend = BackendController()
 
@@ -177,8 +211,25 @@ class MainWindow(QMainWindow):
 
         logo_img = QLabel()
         from config.config import BASE_DIR
-        logo_path = os.path.join(BASE_DIR, "ui", "WhatsApp Image 2026-02-17 at 19.51.32.jpeg")
-        if os.path.exists(logo_path):
+        # Robust multi-path locator for both IDE run and PyInstaller packaged EXE
+        search_dirs = [
+            getattr(sys, '_MEIPASS', ''),
+            os.path.dirname(os.path.abspath(__file__)),
+            BASE_DIR,
+            os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        ]
+        logo_path = None
+        for d in search_dirs:
+            if not d: continue
+            candidate = os.path.join(d, "ui", "WhatsApp Image 2026-02-17 at 19.51.32.jpeg")
+            if os.path.exists(candidate):
+                logo_path = candidate
+                break
+            candidate_alt = os.path.join(d, "assets", "icon.png")
+            if os.path.exists(candidate_alt) and not logo_path:
+                logo_path = candidate_alt
+                
+        if logo_path and os.path.exists(logo_path):
             pix = QPixmap(logo_path).scaled(190, 90, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             logo_img.setPixmap(pix)
         logo_img.setAlignment(Qt.AlignCenter)
@@ -495,8 +546,7 @@ class MainWindow(QMainWindow):
                     role = roles_list[idx] if 0 <= idx < len(roles_list) else "monitor"
                     self.backend.set_cam_role(i, role)
                 self.backend.start_cameras(*srcs)
-                # Automatically start AI workers when cameras are started
-                QTimer.singleShot(2500, self.trigger_start_detection)
+                # Cameras start independently; AI remains paused until user explicitly clicks Start AI
                 
                 # Save config WITHOUT destroying existing IP data
                 from config.cam_config_manager import CamConfigManager
@@ -524,10 +574,16 @@ class MainWindow(QMainWindow):
                 traceback.print_exc()
 
     def toggle_system(self):
-        if self.backend.is_detection_running:
+        if self.backend.is_detection_enabled:
             self.backend.stop_detection()
+            self.sys_btn.setText(" Start AI")
+            self.sys_btn.setStyleSheet(self.START_STYLE)
+            self.sys_btn.setIcon(qta.icon("fa5s.play", color="white"))
         else:
             self.backend.start_detection()
+            self.sys_btn.setText(" Stop AI")
+            self.sys_btn.setStyleSheet(self.STOP_STYLE)
+            self.sys_btn.setIcon(qta.icon("fa5s.stop", color="white"))
 
     def closeEvent(self, event):
         """Cleanly stop all background workers, threads, and streams when application is closed."""
@@ -588,6 +644,26 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, sigint_handler)
 
     app = QApplication(sys.argv)
+    # Robust window icon locator for IDE and PyInstaller EXE
+    icon_search_dirs = [
+        getattr(sys, '_MEIPASS', ''),
+        os.path.dirname(os.path.abspath(__file__)),
+        os.path.dirname(sys.executable)
+    ]
+    icon_path = None
+    for d in icon_search_dirs:
+        if not d: continue
+        candidate_ico = os.path.join(d, "assets", "icon.ico")
+        if os.path.exists(candidate_ico):
+            icon_path = candidate_ico
+            break
+        candidate_png = os.path.join(d, "assets", "icon.png")
+        if os.path.exists(candidate_png):
+            icon_path = candidate_png
+            break
+    if icon_path and os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+
     ThemeManager.apply_theme(app)
 
     # Try Auto-Login first for unattended restarts

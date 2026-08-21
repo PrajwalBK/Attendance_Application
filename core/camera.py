@@ -4,8 +4,8 @@ import time
 import socket
 import os
 
-# [LOW LATENCY RTSP] Disable FFMPEG internal buffer queues to get true real-time feeds
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;500000"
+# [ZERO LATENCY RTSP] Disable FFMPEG internal buffer queues to get true real-time feeds
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;0|framedrop;1"
 
 class ThreadedCamera:
     def __init__(self, src=0):
@@ -38,13 +38,13 @@ class ThreadedCamera:
             self.src_main = input_src
             self.src_sub = input_src
 
-        # [FORCE TIMEOUT] Inject hard timeout directly into RTSP strings
-        if isinstance(self.src_main, str) and self.src_main.startswith("rtsp://"):
-            if "?" in self.src_main: self.src_main += "&timeout=5000000"
-            else: self.src_main += "?timeout=5000000"
-        if isinstance(self.src_sub, str) and self.src_sub.startswith("rtsp://"):
-            if "?" in self.src_sub: self.src_sub += "&timeout=5000000"
-            else: self.src_sub += "?timeout=5000000"
+        # [FORCE TIMEOUT] Inject hard timeout only if not already present
+        for attr in ['src_main', 'src_sub']:
+            val = getattr(self, attr, None)
+            if isinstance(val, str) and val.startswith("rtsp://"):
+                if "timeout=" not in val:
+                    sep = "&" if "?" in val else "?"
+                    setattr(self, attr, f"{val}{sep}timeout=5000000")
 
         # Maintain backward compatibility field
         self.src = self.src_sub
@@ -53,7 +53,7 @@ class ThreadedCamera:
         import platform
         self.is_windows = platform.system() == "Windows"
 
-        # [BULLETPROOF GUARD] Perform 0.5s TCP Handshake before opening
+        # [BULLETPROOF GUARD] Perform 1.5s TCP Handshake before opening
         self.is_alive = True
         if isinstance(self.src_sub, str) and "://" in self.src_sub:
             try:
@@ -63,7 +63,7 @@ class ThreadedCamera:
                 port = int(parts[1]) if len(parts) > 1 else 554
                 
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(0.5)
+                sock.settimeout(1.5)
                 if sock.connect_ex((host, port)) != 0:
                     self.is_alive = False
                 sock.close()
@@ -165,22 +165,24 @@ class ThreadedCamera:
                             time.sleep(2.0)
                     except: pass
 
-            # 3. Read continuously from sub-stream (continuous decoding)
+            # 3. Read continuously from sub-stream (instant non-blocking frame update)
             if self.capture_sub and self.capture_sub.isOpened():
                 try:
                     status, frame = self.capture_sub.read()
-                    if status:
+                    if status and frame is not None and frame.size > 0:
                         self.status = True
                         self.frame = frame
                         self.has_frame = True
                         self.last_frame_time = time.time()
                     else:
                         self.status = False
+                        time.sleep(0.005)
                 except Exception as e:
                     print(f"[CAMERA ERROR] Exception during sub-stream read: {e}")
                     self.status = False
-
-            time.sleep(0.03)
+                    time.sleep(0.01)
+            else:
+                time.sleep(0.05)
 
     def update_main(self):
         while not self.stopped:
@@ -225,17 +227,19 @@ class ThreadedCamera:
         return not is_stale, self.frame
 
     def read_high_res(self):
-        # On-demand grab+retrieve from main-stream (only decodes when snapshot is triggered)
-        # Called synchronously from _save_and_queue_snapshot at detection time
+        # On-demand grab+retrieve from main-stream (1080p/5MP high-resolution snapshot frame)
         if self.capture_main and self.capture_main.isOpened():
             try:
                 with self.main_lock:
                     if self.capture_main.grab():
                         status, frame = self.capture_main.retrieve()
-                        if status and frame is not None:
+                        if status and frame is not None and frame.size > 0:
                             return True, frame
             except Exception as e:
                 print(f"[CAMERA ERROR] Exception during main-stream retrieve: {e}")
+        # Fallback to current frame
+        if self.frame is not None and self.frame.size > 0:
+            return True, self.frame.copy()
         return False, None
 
     def isOpened(self):

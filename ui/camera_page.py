@@ -117,7 +117,7 @@ class CameraPage(QWidget):
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frames)
-        self.timer.start(66)  # ~15 FPS (CCTV standard, optimizes GIL & CPU)
+        self.timer.start(30)  # ~33 FPS zero-lag real-time preview rendering
 
         self.connecting_status = False
         self.backend.worker_signals.status_updated.connect(self.on_status_updated)

@@ -61,6 +61,9 @@ class BackendController(QThread):
         self.workers = [None] * MAX_CAMS
         self.recorder = None
         self.init_lock = multiprocessing.Lock()
+        self.ai_active_event = multiprocessing.Event()
+        self._is_starting_detection = False
+        self._user_stopped_ai = False
         
         # Cameras & Frame Buffer
         self.caps = [None] * MAX_CAMS
@@ -512,10 +515,10 @@ class BackendController(QThread):
             # Ensure we don't have double slashes if {path} was empty
             final_src = final_src.replace("//", "/").replace("rtsp:/", "rtsp://")
             
-            # [FORCE TIMEOUT] Inject hard timeout only if it's an RTSP string
-            if final_src.startswith("rtsp"):
-                if "?" in final_src: final_src += "&timeout=5000000"
-                else: final_src += "?timeout=5000000"
+            # [FORCE TIMEOUT] Inject hard timeout only if not already present
+            if final_src.startswith("rtsp://") and "timeout=" not in final_src:
+                sep = "&" if "?" in final_src else "?"
+                final_src += f"{sep}timeout=5000000"
         
         # [BULLETPROOF HANDSHAKE] Only verify reachable for network streams
         is_reachable = True # Assume reachable for webcams (integers)
@@ -529,7 +532,7 @@ class BackendController(QThread):
                 host = parts[0]
                 port = int(parts[1]) if len(parts) > 1 else 554
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(0.3)
+                sock.settimeout(1.5)
                 if sock.connect_ex((host, port)) == 0:
                     is_reachable = True
                 sock.close()
@@ -559,9 +562,8 @@ class BackendController(QThread):
             print(f"[ERROR] CAM_{i+1} failed to open.")
             self.worker_signals.camera_error.emit(i, f"Failed: {log_src}")
 
-        # Dynamically spawn worker if AI detection is active
-        if self.is_detection_enabled:
-            self._start_single_worker(i)
+        # Pre-load AI worker in RAM so models are ready immediately
+        self._start_single_worker(i)
 
     def broadcast_network_scan(self, progress_callback=None):
         """Scans the network for available IP cameras on subnets 0 and 1."""
@@ -1124,18 +1126,46 @@ class BackendController(QThread):
         
         all_detections = [] # list of (box, score, is_face)
 
-        # 1. Primary Person/Body Detection (YOLOv8 Body Model - Triggers snapshot on ANY detected person body)
+        # 1. Face Detection (Detects heads/faces even when bodies are behind desks/monitors)
+        if self._yolo_session is not None:
+            try:
+                in_name = self._yolo_session.get_inputs()[0].name
+                outputs = self._yolo_session.run(None, {in_name: input_tensor})
+                predictions = outputs[0]
+                if predictions.ndim == 3: predictions = predictions[0]
+                if predictions.shape[0] < predictions.shape[1]: predictions = predictions.T
+                
+                from config.config import get_config
+                conf_thresh = get_config().get('yolo_confidence_threshold', 0.20)
+                keep_idx = predictions[:, 4] > conf_thresh
+                filtered = predictions[keep_idx]
+                
+                for pred in filtered:
+                    cx, cy, nw, nh, score = pred[:5]
+                    x_scale = w / input_size
+                    y_scale = h / input_size
+                    
+                    x1 = (cx - nw / 2) * x_scale
+                    y1 = (cy - nh / 2) * y_scale
+                    x2 = (cx + nw / 2) * x_scale
+                    y2 = (cy + nh / 2) * y_scale
+                    
+                    all_detections.append(([x1, y1, x2, y2], float(score), True))
+            except Exception as e:
+                print(f"[Backend] YOLO Face inference error: {e}", flush=True)
+
+        # 2. Person/Body Detection (YOLOv8 Body Model)
         if self._yolo_body_session is not None:
             try:
-                outputs_body = self._yolo_body_session.run(None, {'images': input_tensor})
+                in_name_b = self._yolo_body_session.get_inputs()[0].name
+                outputs_body = self._yolo_body_session.run(None, {in_name_b: input_tensor})
                 predictions_body = outputs_body[0]
                 if predictions_body.ndim == 3: predictions_body = predictions_body[0]
                 if predictions_body.shape[0] < predictions_body.shape[1]: predictions_body = predictions_body.T
                 
                 from config.config import get_config
-                body_conf_thresh = get_config().get('yolo_body_confidence_threshold', 0.25)
+                body_conf_thresh = get_config().get('yolo_body_confidence_threshold', 0.20)
                 
-                # Check class 0 (person) confidence score in column 4
                 keep_idx_body = predictions_body[:, 4] > body_conf_thresh
                 filtered_body = predictions_body[keep_idx_body]
                 
@@ -1154,33 +1184,6 @@ class BackendController(QThread):
             except Exception as e:
                 print(f"[Backend] YOLO Body inference error: {e}", flush=True)
 
-        # 2. Supplementary Face Detection (YOLOv8 Face Model)
-        if self._yolo_session is not None:
-            try:
-                outputs = self._yolo_session.run(None, {'images': input_tensor})
-                predictions = outputs[0]
-                if predictions.ndim == 3: predictions = predictions[0]
-                if predictions.shape[0] < predictions.shape[1]: predictions = predictions.T
-                
-                from config.config import get_config
-                conf_thresh = get_config().get('yolo_confidence_threshold', 0.25)
-                keep_idx = predictions[:, 4] > conf_thresh
-                filtered = predictions[keep_idx]
-                
-                for pred in filtered:
-                    cx, cy, nw, nh, score = pred[:5]
-                    x_scale = w / input_size
-                    y_scale = h / input_size
-                    
-                    x1 = (cx - nw / 2) * x_scale
-                    y1 = (cy - nh / 2) * y_scale
-                    x2 = (cx + nw / 2) * x_scale
-                    y2 = (cy + nh / 2) * y_scale
-                    
-                    all_detections.append(([x1, y1, x2, y2], float(score), True))
-            except Exception as e:
-                print(f"[Backend] YOLO Face inference error: {e}", flush=True)
-                
         if len(all_detections) == 0:
             return []
             
@@ -1430,180 +1433,175 @@ class BackendController(QThread):
         self._ai_auto_start_attempted = False  # Guard to only auto-start once
         
         while not self.stop_requested:
-            # 1. Main Capture Loop (Centralized Heartbeat)
-            if self.are_cameras_active:
-                # First, read and store all camera frames (takes 0ms)
-                active_cams = []
-                if not hasattr(self, 'frame_ids'):
-                    self.frame_ids = [0] * MAX_CAMS
-                    
-                from core.frame_buffer import FrameBufferManager
-                fbm = FrameBufferManager()
+            try:
+                now = time.time()
+                # 1. Main Capture Loop (Centralized Heartbeat)
+                if self.are_cameras_active:
+                    # First, read and store all camera frames (takes 0ms)
+                    active_cams = []
+                    if not hasattr(self, 'frame_ids'):
+                        self.frame_ids = [0] * MAX_CAMS
+                        
+                    from core.frame_buffer import FrameBufferManager
+                    fbm = FrameBufferManager()
 
-                for i in range(self.active_cam_count):
-                    if i < MAX_CAMS and self.caps[i] and self.caps[i].isOpened():
-                        ret, frame = self.caps[i].read()
-                        if ret and frame is not None:
-                            self.latest_frames[i] = frame
-                            self.frame_ids[i] += 1
-                            frame_id = self.frame_ids[i]
-                            
-                            # Push frame matrix to reference-counted ring FrameBuffer
-                            fbm.push_frame(i, frame_id, frame)
-                            
-                            # Feed the Recorder ONLY if camera is not in "Monitor" mode and recording is enabled
-                            if self.record_video and self.recorder and not self.recording_queue.full():
-                                if str(self.cam_roles[i]).lower() != 'monitor':
-                                    try:
-                                        self.recording_queue.put_nowait((i, frame, time.time()))
-                                        if int(time.time()) % 10 == 0 and i == 0:
-                                            print(f"[BACKEND] Dispatching frames to recorder...")
-                                    except: pass
-                                    
-                            # Process active cameras for triage person detection & snapshot capture whenever CAMERAS ARE ACTIVE!
-                            # This operates 100% independently of AI worker start/stop state.
-                            if self.are_cameras_active:
+                    for i in range(self.active_cam_count):
+                        if i < MAX_CAMS and self.caps[i] and self.caps[i].isOpened():
+                            ret, frame = self.caps[i].read()
+                            if ret and frame is not None:
+                                self.latest_frames[i] = frame
+                                self.frame_ids[i] += 1
+                                frame_id = self.frame_ids[i]
+                                
+                                # Push frame matrix to reference-counted ring FrameBuffer
+                                fbm.push_frame(i, frame_id, frame)
+                                
+                                # Feed the Recorder ONLY if camera is not in "Monitor" mode and recording is enabled
+                                if self.record_video and self.recorder and not self.recording_queue.full():
+                                    if str(self.cam_roles[i]).lower() != 'monitor':
+                                        try:
+                                            self.recording_queue.put_nowait((i, frame, time.time()))
+                                            if int(time.time()) % 10 == 0 and i == 0:
+                                                print(f"[BACKEND] Dispatching frames to recorder...")
+                                        except: pass
+                                        
+                                # Process active cameras for triage person detection & snapshot capture whenever cameras are active
                                 self.frame_counters[i] += 1
                                 if self.frame_counters[i] % self.process_every_n_frames == 0:
                                     active_cams.append((i, frame, frame_id))
 
-                # Run triage detections concurrently in the ThreadPoolExecutor (releases GIL)
-                triage_results = {}
-                if active_cams:
-                    if not hasattr(self, '_triage_executor'):
-                        from concurrent.futures import ThreadPoolExecutor
-                        self._triage_executor = ThreadPoolExecutor(max_workers=MAX_CAMS)
-                    
-                    def run_detect(cam_idx, cam_frame, fid):
-                        try:
-                            return cam_idx, self._triage_detect(cam_frame), fid
-                        except Exception as e:
-                            print(f"[Backend Error] Parallel triage failed on Cam {cam_idx}: {e}", flush=True)
-                            return cam_idx, [], fid
-                            
-                    futures = [self._triage_executor.submit(run_detect, idx, f, fid) for idx, f, fid in active_cams]
-                    for fut in futures:
-                        try:
-                            idx, boxes, fid = fut.result()
-                            triage_results[idx] = (boxes, fid)
-                        except Exception as e:
-                            print(f"[Backend Error] Future resolution error: {e}", flush=True)
-
-                # Process results and update trackers sequentially in the main backend thread
-                for i, frame, current_fid in active_cams:
-                    if i in triage_results:
-                        boxes, fid = triage_results[i]
-                        try:
-                            # 2. Multi-Person Tracker Update (core/tracker.py)
-                            now = time.time()
-                            if not hasattr(self, 'multi_person_trackers') or len(self.multi_person_trackers) <= i:
-                                from core.tracker import MultiPersonTracker
-                                while len(getattr(self, 'multi_person_trackers', [])) <= i:
-                                    if not hasattr(self, 'multi_person_trackers'):
-                                        self.multi_person_trackers = []
-                                    self.multi_person_trackers.append(MultiPersonTracker(len(self.multi_person_trackers)))
-                                    
-                            tracker = self.multi_person_trackers[i]
-                            active_tracks = tracker.update(boxes, now, frame=frame)
-                            
-                            # Instant & Continuous Snapshot Capture Pipeline
-                            from core.track_manager import TrackManager, TrackState
-                            from core.snapshot_manager import SnapshotPipelineManager, SnapshotTask
-                            
-                            tm = TrackManager()
-                            spm = SnapshotPipelineManager(ai_task_queues=self.task_queues)
-                            
-                            SNAPSHOT_INTERVAL_SEC = 0.5  # Captures 2 images per second (every 0.5s) continuously
-                            
-                            for track in active_tracks:
-                                last_snap = getattr(track, 'last_snapshot_time', 0.0)
-                                if (now - last_snap) >= SNAPSHOT_INTERVAL_SEC or track.state == TrackState.NEW:
-                                    track.last_snapshot_time = now
-                                    if track.state == TrackState.NEW:
-                                        tm.notify_snapshot_requested(i, track.track_id)
-                                        
-                                    role = str(self.cam_roles[i]).lower() if i < len(self.cam_roles) else 'entrance'
-                                    if role in ['entrance', 'in']:
-                                        track_dir = 'entrance'
-                                    elif role in ['exit', 'out']:
-                                        track_dir = 'exit'
-                                    else:
-                                        track_dir = 'exit' if i % 2 == 1 else 'entrance'
-
-                                    task = SnapshotTask(
-                                        track_id=track.track_id,
-                                        camera_id=i,
-                                        frame_id=fid,
-                                        bounding_box=track.bounding_box,
-                                        direction=track_dir,
-                                        frame_timestamp=now,
-                                        frame_matrix=frame.copy()  # Pass frame directly — no FrameBuffer timing race
-                                    )
-                                    spm.enqueue_task(i, task)
-                        except Exception as e:
-                            print(f"[BACKEND ERROR] Triage/Queue Error on Cam {i}: {e}", flush=True)
-
-            # [SELF-HEALING] Auto-start AI workers if cameras are active but workers aren't running
-            # This guarantees workers start even if the QTimer-based start_detection fails
-            now = time.time()
-            if self.are_cameras_active and not getattr(self, '_user_stopped_ai', False):
-                if self._cameras_active_since == 0:
-                    self._cameras_active_since = now
-                    self._ai_auto_start_attempted = False
-                
-                # After 5 seconds of cameras being active, check if AI workers are running
-                if not self._ai_auto_start_attempted and (now - self._cameras_active_since) >= 5.0:
-                    active_workers = sum(1 for w in self.workers if w and w.is_alive())
-                    if active_workers == 0:
-                        print(f"[SELF-HEALING] Cameras active for {now - self._cameras_active_since:.1f}s but 0 AI workers running. Auto-starting detection...", flush=True)
-                        self._ai_auto_start_attempted = True
-                        self.is_detection_enabled = True
-                        if not hasattr(self, 'init_lock') or self.init_lock is None:
-                            self.init_lock = multiprocessing.Lock()
-                        threading.Thread(target=self._start_detection_async, daemon=True).start()
-                    else:
-                        self._ai_auto_start_attempted = True  # Workers are already running, no need to check again
-            else:
-                self._cameras_active_since = 0
-                self._ai_auto_start_attempted = False
-
-            # 2. Folder Scanning for Offline Snapshot Detection
-            if now - self.last_folder_scan >= 2.0:
-                self.last_folder_scan = now
-                if self.is_detection_enabled:
-                    self.scan_pending_snapshots()
-            
-            # Offline Cache Synchronization Check
-            if now - self.last_offline_sync >= 15.0:
-                self.last_offline_sync = now
-                if self.is_detection_enabled and self.api_client:
-                    threading.Thread(target=self.sync_offline_records, daemon=True).start()
-            
-            # 2. Process AI Results
-            try:
-                while True:
-                    try:
-                        result = self.result_queue.get_nowait()
+                    # Run triage detections concurrently in the ThreadPoolExecutor (releases GIL)
+                    triage_results = {}
+                    if active_cams:
+                        if not hasattr(self, '_triage_executor'):
+                            from concurrent.futures import ThreadPoolExecutor
+                            self._triage_executor = ThreadPoolExecutor(max_workers=MAX_CAMS)
                         
-                        if result.get('type') == 'stats':
-                            total = result.get('total', 0)
-                            self.worker_signals.stats_updated.emit(result)
+                        def run_detect(cam_idx, cam_frame, fid):
+                            try:
+                                return cam_idx, self._triage_detect(cam_frame), fid
+                            except Exception as e:
+                                print(f"[Backend Error] Parallel triage failed on Cam {cam_idx}: {e}", flush=True)
+                                return cam_idx, [], fid
+                                
+                        futures = [self._triage_executor.submit(run_detect, idx, f, fid) for idx, f, fid in active_cams]
+                        for fut in futures:
+                            try:
+                                idx, boxes, fid = fut.result()
+                                triage_results[idx] = (boxes, fid)
+                            except Exception as e:
+                                print(f"[Backend Error] Future resolution error: {e}", flush=True)
+
+                    # Process results and update trackers sequentially in the main backend thread
+                    for i, frame, current_fid in active_cams:
+                        if i in triage_results:
+                            boxes, fid = triage_results[i]
+                            try:
+                                # 2. Multi-Person Tracker Update (core/tracker.py)
+                                if not hasattr(self, 'multi_person_trackers') or len(self.multi_person_trackers) <= i:
+                                    from core.tracker import MultiPersonTracker
+                                    while len(getattr(self, 'multi_person_trackers', [])) <= i:
+                                        if not hasattr(self, 'multi_person_trackers'):
+                                            self.multi_person_trackers = []
+                                        self.multi_person_trackers.append(MultiPersonTracker(len(self.multi_person_trackers)))
+                                        
+                                tracker = self.multi_person_trackers[i]
+                                active_tracks = tracker.update(boxes, now, frame=frame)
+                                if active_tracks and len(active_tracks) > 0:
+                                    print(f"[TRIAGE] Cam {i+1}: Tracking {len(active_tracks)} person(s).", flush=True)
+                                
+                                # Instant & Continuous Snapshot Capture Pipeline
+                                from core.track_manager import TrackManager, TrackState
+                                from core.snapshot_manager import SnapshotPipelineManager, SnapshotTask
+                                
+                                tm = TrackManager()
+                                spm = SnapshotPipelineManager(ai_task_queues=self.task_queues)
+                                
+                                from config.config import SNAPSHOT_INTERVAL_SECONDS
+                                SNAPSHOT_INTERVAL_SEC = SNAPSHOT_INTERVAL_SECONDS  # 2 snapshots per second (0.5s) continuous capture
+                                
+                                for track in active_tracks:
+                                    last_snap = getattr(track, 'last_snapshot_time', 0.0)
+                                    if (now - last_snap) >= SNAPSHOT_INTERVAL_SEC or track.state == TrackState.NEW:
+                                        track.last_snapshot_time = now
+                                        if track.state == TrackState.NEW:
+                                            tm.notify_snapshot_requested(i, track.track_id)
+                                            
+                                        role = str(self.cam_roles[i]).lower() if i < len(self.cam_roles) else 'entrance'
+                                        if role in ['entrance', 'in']:
+                                            track_dir = 'entrance'
+                                        elif role in ['exit', 'out']:
+                                            track_dir = 'exit'
+                                        else:
+                                            track_dir = 'exit' if i % 2 == 1 else 'entrance'
+
+                                        # Try to fetch high-resolution (1080p/5MP) main stream frame for crystal clear snapshot saving
+                                        snap_matrix = None
+                                        if i < len(self.caps) and self.caps[i] is not None:
+                                            try:
+                                                ok_hr, hr_frame = self.caps[i].read_high_res()
+                                                if ok_hr and hr_frame is not None and hr_frame.size > 0:
+                                                    snap_matrix = hr_frame
+                                            except Exception: pass
+                                        if snap_matrix is None:
+                                            snap_matrix = frame.copy()
+
+                                        task = SnapshotTask(
+                                            track_id=track.track_id,
+                                            camera_id=i,
+                                            frame_id=fid,
+                                            bounding_box=track.bounding_box,
+                                            direction=track_dir,
+                                            frame_timestamp=now,
+                                            frame_matrix=snap_matrix
+                                        )
+                                        spm.enqueue_task(i, task)
+                            except Exception as e:
+                                print(f"[BACKEND ERROR] Triage/Queue Error on Cam {i}: {e}", flush=True)
+
+                # 2. Folder Scanning for Offline Snapshot Detection
+                if now - self.last_folder_scan >= 2.0:
+                    self.last_folder_scan = now
+                    if self.is_detection_enabled:
+                        self.scan_pending_snapshots()
+                
+                # Offline Cache Synchronization Check
+                if now - self.last_offline_sync >= 15.0:
+                    self.last_offline_sync = now
+                    if self.is_detection_enabled and self.api_client:
+                        threading.Thread(target=self.sync_offline_records, daemon=True).start()
+                
+                # 3. Process AI Results from Worker Pool
+                try:
+                    while True:
+                        try:
+                            result = self.result_queue.get_nowait()
                             
-                            # [WARNING] Alert when recognition is blind
-                            if total == 0:
-                                warning = {
-                                    'type': 'warning',
-                                    'message': "AI IS BLIND: 0 Registered faces found. Recognition will not occur.",
-                                    'worker': result.get('worker')
-                                }
-                                self.worker_signals.detection_occurred.emit(warning)
-                                print(f"[CRITICAL] Worker {result.get('worker')} is blind (0 faces).")
-                        else:
-                            self.worker_signals.detection_occurred.emit(result)
-                    except Exception:
-                        break
-            except Exception as e:
-                print(f"[BACKEND ERROR] {e}")
+                            if result.get('type') == 'stats':
+                                total = result.get('total', 0)
+                                self.worker_signals.stats_updated.emit(result)
+                                
+                                # [WARNING] Alert when recognition is blind
+                                if total == 0:
+                                    warning = {
+                                        'type': 'warning',
+                                        'message': "AI IS BLIND: 0 Registered faces found. Recognition will not occur.",
+                                        'worker': result.get('worker')
+                                    }
+                                    self.worker_signals.detection_occurred.emit(warning)
+                                    print(f"[CRITICAL] Worker {result.get('worker')} is blind (0 faces).")
+                            else:
+                                print(f"[BACKEND] Emitting detection_occurred signal: {result.get('name')} (ID: {result.get('id')})", flush=True)
+                                self.worker_signals.detection_occurred.emit(result)
+                        except Exception:
+                            break
+                except Exception as e:
+                    print(f"[BACKEND ERROR] AI Result queue error: {e}")
+
+            except Exception as loop_err:
+                print(f"[BACKEND RUNTIME ERROR] Loop exception: {loop_err}", flush=True)
+                import traceback
+                traceback.print_exc()
 
             time.sleep(0.05)
             
@@ -1611,39 +1609,9 @@ class BackendController(QThread):
         self.is_running = False
         self.worker_signals.status_updated.emit("System Offline")
 
-    def start_detection(self):
-        """Spawns a thread to initialize AI Workers for any active cameras missing one."""
-        import math
-        # 1 AI worker for every 2 active cameras
-        self.num_ai_workers = max(1, math.ceil(self.active_cam_count / 2.0))
-        if len(self.workers) != self.num_ai_workers:
-            old_workers = self.workers
-            self.workers = [None] * self.num_ai_workers
-            for idx in range(min(len(old_workers), self.num_ai_workers)):
-                self.workers[idx] = old_workers[idx]
-
-        print(f"[BACKEND] start_detection() called. is_detection_enabled={self.is_detection_enabled}, active_cams={self.active_cam_count}, workers={self.num_ai_workers}", flush=True)
-        if getattr(self, '_is_starting_detection', False):
-            print("[BACKEND] Detection is already starting. Skipping duplicate start.", flush=True)
-            return
-        if self.is_detection_enabled and any(w and w.is_alive() for w in self.workers):
-            print("[BACKEND] Detection already running. Skipping duplicate start.", flush=True)
-            return
-        self.is_detection_enabled = True
-        self._user_stopped_ai = False
-        self._is_starting_detection = True
-        if hasattr(self, 'snapshot_manager') and self.snapshot_manager:
-            if not self.snapshot_manager.is_alive():
-                self.snapshot_manager.start()
-            self.snapshot_manager.dispatched_files.clear()
-            self.snapshot_manager.scan_pending_snapshots()
-        # Always create a new Lock to prevent deadlocks from previously terminated processes holding the lock
-        self.init_lock = multiprocessing.Lock()
-        threading.Thread(target=self._start_detection_async, daemon=True).start()
-
     def _start_single_worker(self, i):
-        """Helper to start/restart a worker dynamically for a single active camera slot."""
-        if not self.is_detection_enabled or i >= self.active_cam_count:
+        """Helper to pre-load a worker in RAM for a single active camera slot."""
+        if i >= self.active_cam_count:
             return
         role = self.cam_roles[i] if i < len(self.cam_roles) else 'monitor'
         if str(role).lower() == 'monitor':
@@ -1662,14 +1630,15 @@ class BackendController(QThread):
                 api_user=self.auth_email, api_pass=self.auth_pass,
                 init_lock=self.init_lock,
                 event_type=event_type,
-                other_queues=self.task_queues
+                other_queues=self.task_queues,
+                active_event=self.ai_active_event
             )
             self.workers[i].start()
-            print(f"[BACKEND] Started AttendanceWorker {i+1} dynamically for Camera {i} | Role: {role.upper()}")
+            print(f"[BACKEND] Pre-loaded AttendanceWorker {i+1} in RAM for Camera {i} | Role: {role.upper()}", flush=True)
 
     def _start_detection_async(self):
         try:
-            print(f"[BACKEND] _start_detection_async: Starting AI workers for {self.active_cam_count} cameras...", flush=True)
+            print(f"[BACKEND] _start_detection_async: Ensuring AI workers for {self.active_cam_count} cameras...", flush=True)
             self.worker_signals.status_updated.emit("Starting AI Workers...")
 
             while len(self.workers) < self.active_cam_count:
@@ -1687,14 +1656,19 @@ class BackendController(QThread):
                         api_user=self.auth_email, api_pass=self.auth_pass,
                         init_lock=self.init_lock,
                         event_type=event_type,
-                        other_queues=self.task_queues
+                        other_queues=self.task_queues,
+                        active_event=self.ai_active_event
                     )
                     self.workers[i].start()
                     print(f"[BACKEND] AttendanceWorker {i+1} started (pid={self.workers[i].pid})", flush=True)
 
             active_workers = sum(1 for w in self.workers if w and w.is_alive())
-            print(f"[BACKEND] AI Worker Pool launched. Active: {active_workers}/{self.active_cam_count}", flush=True)
-            self.worker_signals.status_updated.emit(f"Detection Active ({active_workers} AI workers)")
+            print(f"[BACKEND] AI Worker Pool ready. Active: {active_workers}/{self.active_cam_count}", flush=True)
+            if self.is_detection_enabled:
+                self.ai_active_event.set()
+                self.worker_signals.status_updated.emit(f"Detection Active ({active_workers} AI workers)")
+            else:
+                self.worker_signals.status_updated.emit(f"Workers Standing By ({active_workers} loaded)")
         except Exception as e:
             print(f"CRITICAL: AI Startup Failed! {e}")
             import traceback
@@ -1703,34 +1677,49 @@ class BackendController(QThread):
         finally:
             self._is_starting_detection = False
 
+    @property
+    def is_detection_running(self):
+        return self.is_detection_enabled
+
+    def start_detection(self):
+        self.is_detection_enabled = True
+        self._user_stopped_ai = False
+        self.ai_active_event.set()
+        
+        active_workers = sum(1 for w in self.workers if w and w.is_alive())
+        if active_workers < self.active_cam_count:
+            if not self._is_starting_detection:
+                self._is_starting_detection = True
+                threading.Thread(target=self._start_detection_async, daemon=True).start()
+        else:
+            self.worker_signals.status_updated.emit(f"Detection Active ({active_workers} AI workers)")
+            print(f"[BACKEND] AI Detection resumed instantly with {active_workers} pre-warmed workers.", flush=True)
+
     def stop_detection(self, wait=False):
         self.is_detection_enabled = False
         self._user_stopped_ai = True
-        if hasattr(self, 'shared_task_queue') and self.shared_task_queue:
-            try:
-                self.shared_task_queue.cancel_join_thread()
-                for _ in range(max(1, len(self.workers) * 2)):
-                    self.shared_task_queue.put_nowait(None)
-            except: pass
+        self.ai_active_event.clear()
+        
+        active_workers = sum(1 for w in self.workers if w and w.is_alive())
+        self.worker_signals.status_updated.emit(f"AI Paused ({active_workers} workers standing by)")
+        print(f"[BACKEND] AI Detection paused. All {active_workers} workers remain loaded in RAM for instant start.", flush=True)
 
+    def stop_system(self):
+        self.stop_requested = True
+        self.ai_active_event.set()
         for i, w in enumerate(self.workers):
             if w:
                 try:
                     w.stop()
                     if w.is_alive():
                         w.terminate()
+                        w.join(timeout=0.2)
                 except: pass
                 self.workers[i] = None
                 
-        # Note: Recorder is explicitly NOT stopped here. It runs as long as cameras run.
-        self.worker_signals.status_updated.emit("Detection Stopped")
-
-    def stop_system(self):
-        self.stop_requested = True
         if hasattr(self, 'snapshot_manager') and self.snapshot_manager:
             try: self.snapshot_manager.stop()
             except: pass
-        self.stop_detection(wait=True)
         self.stop_cameras()
         
         # [HANG FIX] Cancel Queue join threads to prevent Python from blocking indefinitely on exit

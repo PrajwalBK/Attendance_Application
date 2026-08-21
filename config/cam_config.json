@@ -18,8 +18,8 @@
                 1.0
             ],
             "direction_rules": {
-                "up": "out",
-                "down": "in",
+                "up": "ignore",
+                "down": "ignore",
                 "left": "ignore",
                 "right": "ignore"
             }
@@ -36,8 +36,8 @@
                 1.0
             ],
             "direction_rules": {
-                "up": "out",
-                "down": "in",
+                "up": "ignore",
+                "down": "ignore",
                 "left": "ignore",
                 "right": "ignore"
             }

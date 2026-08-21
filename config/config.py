@@ -96,6 +96,7 @@ MATCHING_CENTROID_WEIGHT = 0.3
 
 # --- PER-CAMERA ISOLATED SNAPSHOT PIPELINE CONFIGURATION ---
 FRAME_BUFFER_SECONDS = 2.0
+SNAPSHOT_INTERVAL_SECONDS = 0.5  # 2 snapshots per second (every 0.5s) per person
 SNAPSHOT_QUEUE_TIMEOUT = 1.0
 SNAPSHOT_PADDING = 0.20
 
@@ -115,13 +116,9 @@ EXECUTION_PROVIDERS = ['CPUExecutionProvider']
 
 print(f"[GPU CHECK] Forced strictly to CPU: {EXECUTION_PROVIDERS}", flush=True)
 
-# ONNX Runtime Thread Limits
-if getattr(sys, 'frozen', False):
-    ORT_INTRA_OP_NUM_THREADS = 1
-    ORT_INTER_OP_NUM_THREADS = 1
-else:
-    ORT_INTRA_OP_NUM_THREADS = 2
-    ORT_INTER_OP_NUM_THREADS = 2
+# ONNX Runtime Thread Limits (Balanced for multi-worker CPU processing)
+ORT_INTRA_OP_NUM_THREADS = 2
+ORT_INTER_OP_NUM_THREADS = 1
 
 # Background AI Worker Pool Size
 NUM_AI_WORKERS = 3

@@ -324,7 +324,15 @@ class SnapshotPipelineManager:
             now = time.time()
             
             with self.lock:
-                for filepath in files[:50]:
+                # Prune stale entries from queued_files set
+                existing_set = set(files)
+                if not hasattr(self, 'queued_files'):
+                    self.queued_files = set()
+                self.queued_files = self.queued_files.intersection(existing_set)
+
+                for filepath in files[:20]:
+                    if filepath in self.queued_files:
+                        continue
                     if (now - os.path.getmtime(filepath)) < 0.5:
                         continue
                         
@@ -338,17 +346,42 @@ class SnapshotPipelineManager:
                         q = self.ai_task_queues[q_idx]
                         try:
                             q.put_nowait(filepath)
+                            self.queued_files.add(filepath)
                         except Exception:
                             pass
         except Exception:
             pass
 
+    def clear_queues(self):
+        """Drains all internal camera queues and clears tracking sets."""
+        with self.lock:
+            if hasattr(self, 'queued_files'):
+                self.queued_files.clear()
+            if hasattr(self, 'dispatched_files'):
+                self.dispatched_files.clear()
+            for q in self.queues.values():
+                try:
+                    while not q.empty():
+                        try: q.get_nowait()
+                        except: break
+                except Exception: pass
+
+    def stop(self):
+        """Stops supervisor, stops all camera worker threads, and clears queues."""
+        with self.lock:
+            if self.supervisor:
+                self.supervisor.is_running = False
+            for worker in self.workers.values():
+                if worker:
+                    worker.is_running = False
+            self.clear_queues()
+
     def is_alive(self):
         """Returns True if supervisor or any dedicated camera worker thread is alive."""
         with self.lock:
-            if self.supervisor and self.supervisor.is_alive():
+            if self.supervisor and self.supervisor.is_running and self.supervisor.is_alive():
                 return True
-            return any(w and w.is_alive() for w in self.workers.values())
+            return any(w and w.is_running and w.is_alive() for w in self.workers.values())
 
     def start(self):
         """Starts supervisor and ensures dedicated camera workers are active."""
@@ -356,6 +389,8 @@ class SnapshotPipelineManager:
             if self.supervisor is None or not self.supervisor.is_alive():
                 self.supervisor = SnapshotSupervisor(self)
                 self.supervisor.start()
+            else:
+                self.supervisor.is_running = True
 
 
 # Compatibility wrapper functions for legacy callers

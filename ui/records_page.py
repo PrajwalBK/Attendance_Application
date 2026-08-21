@@ -12,58 +12,6 @@ class RecordsPage(QWidget):
         super().__init__()
         self.backend = backend_controller
         self.setup_ui()
-        
-        # Load history on startup
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(500, self.load_historical_data)
-
-    def load_historical_data(self):
-        """Fetches last 100 logs from DB or API on startup."""
-        try:
-            from config.config import get_config
-            cfg = get_config()
-            
-            db = None
-            if not cfg.get('use_api', True):
-                from database.database import DatabaseManager
-                db = DatabaseManager()
-            elif hasattr(self.backend, 'api_client') and self.backend.api_client:
-                db = self.backend.api_client
-            elif hasattr(self.backend, 'db') and self.backend.db:
-                db = self.backend.db
-            else:
-                # Guard: Don't attempt API calls if we haven't authenticated yet
-                token = getattr(self.backend, 'auth_token', None)
-                if not token:
-                    return
-                
-                email = getattr(self.backend, 'auth_email', None)
-                password = getattr(self.backend, 'auth_pass', None)
-                
-                from core.api_client import APIClient
-                db = APIClient(
-                    cfg.get('api_base_url'),
-                    api_user=email,
-                    api_password=password,
-                    token=token
-                )
-            
-            if db:
-                logs = db.get_recent_logs()
-                if logs:
-                    for log in reversed(logs):
-                        pid, name, date, time_str, event_type = log
-                        data = {
-                            'type': 'match',
-                            'id': pid,
-                            'name': name,
-                            'timestamp': time_str,
-                            'event_type': (event_type or 'IN').upper()
-                        }
-                        self.add_detection(data)
-        except Exception as e:
-            print(f"Error loading historical logs: {e}")
-        self.load_data()
 
     def setup_ui(self):
         main_layout = QVBoxLayout(self)
@@ -92,11 +40,11 @@ class RecordsPage(QWidget):
         self.filter_buttons = {}
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(8)
-        for text in ["Login", "Logout", "Unknown"]:
+        for text in ["All", "Login", "Logout"]:
             btn = QPushButton(text)
             btn.setObjectName("FilterButton")
             btn.setCheckable(True)
-            if text == "Login": btn.setChecked(True)
+            if text == "All": btn.setChecked(True)
             btn.clicked.connect(lambda checked, t=text: self.filter_logs(t))
             btn_layout.addWidget(btn)
             self.filter_buttons[text] = btn
@@ -122,78 +70,80 @@ class RecordsPage(QWidget):
         main_layout.addWidget(self.log_list)
 
     def load_data(self):
-        # Empty on startup — populated by real backend detections only
-        self.log_list.clear()
+        # Kept for compatibility but not clearing logs to preserve history
+        pass
 
     def add_detection(self, data):
         """Called by MainWindow when backend emits detection_occurred."""
-        evt = str(data.get('event_type', 'IN')).upper()
-        name = str(data.get('name') or 'Unknown')
-        worker_id = data.get('worker', 0)
-        confidence = data.get('sim') or data.get('confidence') or 0.0
-        timestamp = data.get('timestamp', '--:--:--')
-        cam_ch = f"Cam {worker_id + 1}"
-        department = data.get('dept') or data.get('department') or "---"
-        # Map to display status
-        pid = data.get('id')
-        
-        if name.upper() == 'UNKNOWN':
-            status = 'Alert'
-            # [USER REQUEST] Hide alerts from detection logs by default
-            return 
+        try:
+            name = str(data.get('name') or 'Unknown')
+            # [USER REQUIREMENT] Do not show UNKNOWN detections in the logs
+            if name.upper() == 'UNKNOWN' or str(data.get('id', '')).upper() in ('NONE', 'UNKNOWN', ''):
+                return
+                
+            evt = str(data.get('event_type', 'IN')).upper()
+            worker_id = data.get('worker', 0)
+            confidence = data.get('sim') or data.get('confidence') or 0.0
+            timestamp = data.get('timestamp') or datetime.now().strftime('%H:%M:%S')
+            if timestamp == '--:--:--':
+                timestamp = datetime.now().strftime('%H:%M:%S')
+            cam_ch = f"Cam {worker_id}" if isinstance(worker_id, int) and worker_id > 0 else "Cam 1"
+            department = data.get('dept') or data.get('department') or "---"
+            pid = data.get('id')
             
-        elif evt in ('IN', 'LOGIN'):
-            status = 'Login'
-            self._counts['logins'] += 1
-            if pid: self._present_set.add(pid)
-        else:
-            status = 'Logout'
-            self._counts['logouts'] += 1
-            # If they logout, they are still "Present" in terms of having been seen today?
-            # Or does Present mean "Currently In"? 
-            # Usually Attendance Present = Seen Today.
-            if pid: self._present_set.add(pid)
+            if evt in ('IN', 'LOGIN', 'ENTRANCE'):
+                status = 'Login'
+                self._counts['logins'] += 1
+                if pid: self._present_set.add(pid)
+            else:
+                status = 'Logout'
+                self._counts['logouts'] += 1
+                if pid: self._present_set.add(pid)
 
-        # Update metrics
-        self._counts['present'] = len(self._present_set)
-        self._counts['absent'] = max(0, self._total_employees - self._counts['present'])
+            # Update metrics
+            self._counts['present'] = len(self._present_set)
+            self._counts['absent'] = max(0, self._total_employees - self._counts['present'])
 
-        # Safety check: Update labels only if they exist
-        if 'present' in self._metric_labels: self._metric_labels['present'].setText(str(self._counts['present']))
-        if 'absent' in self._metric_labels: self._metric_labels['absent'].setText(str(self._counts['absent']))
-        if 'logins' in self._metric_labels: self._metric_labels['logins'].setText(str(self._counts['logins']))
-        if 'logouts' in self._metric_labels: self._metric_labels['logouts'].setText(str(self._counts['logouts']))
-        
-        # Bottom log counter
-        total_logs = self._counts['logins'] + self._counts['logouts']
-        self.count_lbl.setText(str(total_logs))
+            if 'present' in self._metric_labels: self._metric_labels['present'].setText(str(self._counts['present']))
+            if 'absent' in self._metric_labels: self._metric_labels['absent'].setText(str(self._counts['absent']))
+            if 'logins' in self._metric_labels: self._metric_labels['logins'].setText(str(self._counts['logins']))
+            if 'logouts' in self._metric_labels: self._metric_labels['logouts'].setText(str(self._counts['logouts']))
+            
+            if hasattr(self, 'count_lbl') and self.count_lbl:
+                self.count_lbl.setText(str(self.log_list.count() + 1))
 
-        row_data = {
-            'time': timestamp,
-            'name': name,
-            'dept': department,
-            'cam': cam_ch,
-            'conf': float(confidence),
-            'status': status
-        }
-        
-        item = QListWidgetItem()
-        item.setSizeHint(QSize(0, 65))
-        item.setData(Qt.UserRole, status) # Store status for filtering
-        
-        self.log_list.insertItem(0, item)
-        self.log_list.setItemWidget(item, self.create_log_row(row_data))
-        
-        # Apply current filter to new item
-        active_filter = "All"
-        for text, btn in self.filter_buttons.items():
-            if btn.isChecked():
-                active_filter = text
-                break
-        self.filter_logs(active_filter)
+            row_data = {
+                'time': timestamp,
+                'name': name,
+                'dept': department,
+                'cam': cam_ch,
+                'conf': float(confidence),
+                'status': status
+            }
+            
+            item = QListWidgetItem()
+            item.setSizeHint(QSize(0, 65))
+            item.setData(Qt.UserRole, status) # Store status for filtering
+            
+            self.log_list.insertItem(0, item)
+            self.log_list.setItemWidget(item, self.create_log_row(row_data))
+            
+            # Apply current filter to new item
+            active_filter = "All"
+            for text, btn in self.filter_buttons.items():
+                if btn.isChecked():
+                    active_filter = text
+                    break
+            self.filter_logs(active_filter)
 
-        if self.log_list.count() > 200:
-            self.log_list.takeItem(self.log_list.count() - 1)
+            if self.log_list.count() > 200:
+                self.log_list.takeItem(self.log_list.count() - 1)
+
+            print(f"[RECORDS PAGE] Added log: {name} | {status} | {timestamp}", flush=True)
+        except Exception as e:
+            print(f"[RECORDS PAGE ERROR] Error rendering log row: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
 
     def filter_logs(self, filter_type):
         """Filters the list based on status."""
@@ -240,7 +190,7 @@ class RecordsPage(QWidget):
         avatar.setFixedSize(32, 32)
         initials = data['name'][0] if data['name'] != "Unknown" else "?"
         bg_color = ThemeManager.COLORS['primary'] if data['status'] == "Login" else "#475569"
-        if data['status'] == "Alert": bg_color = ThemeManager.COLORS['error']
+        if data['status'] in ("Alert", "Unknown"): bg_color = "#f59e0b"
         avatar.setText(initials)
         avatar.setAlignment(Qt.AlignCenter)
         avatar.setStyleSheet(f"background-color: {bg_color}; color: white; border-radius: 16px; font-weight: bold; font-size: 11px;")

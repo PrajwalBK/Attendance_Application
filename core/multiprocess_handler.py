@@ -40,7 +40,7 @@ class AttendanceWorker(multiprocessing.Process):
     Processes VIDEO FILES instead of live frames.
     Scans every single frame for maximum accuracy.
     """
-    def __init__(self, task_queue, result_queue, worker_id, assigned_cam_index=0, api_user=None, api_pass=None, init_lock=None, event_type=None, other_queues=None):
+    def __init__(self, task_queue, result_queue, worker_id, assigned_cam_index=0, api_user=None, api_pass=None, init_lock=None, event_type=None, other_queues=None, active_event=None):
         super().__init__()
         self.task_queue = task_queue
         self.result_queue = result_queue
@@ -51,6 +51,7 @@ class AttendanceWorker(multiprocessing.Process):
         self.init_lock = init_lock
         self.event_type = event_type # [NEW] Explicit Role (IN, OUT, or None)
         self.other_queues = other_queues
+        self.active_event = active_event
         self.stop_event = multiprocessing.Event()
         self.daemon = True 
         
@@ -157,6 +158,11 @@ class AttendanceWorker(multiprocessing.Process):
         try:
             idle_counter = 0
             while not self.stop_event.is_set():
+                # If AI is paused, keep worker and models loaded in memory, waiting for start AI signal
+                if self.active_event is not None and not self.active_event.is_set():
+                    self.active_event.wait(timeout=0.5)
+                    continue
+
                 try:
                     # Check scavenged files first, then wait for file path from queue
                     if self.scavenged_files:
@@ -244,7 +250,7 @@ class AttendanceWorker(multiprocessing.Process):
                     self._log_debug("Poison sentinel received. Worker process exiting cleanly.")
                     break
 
-                if not isinstance(video_path, str):
+                if not isinstance(video_path, str) or not os.path.exists(video_path):
                     continue
 
                 self._log_debug(f"Processing: {video_path}")
@@ -660,7 +666,7 @@ class AttendanceWorker(multiprocessing.Process):
             event_type = self.event_type.lower() if self.event_type else 'monitor'
             
         # 2. Read image
-        frame = cv2.imread(filepath)
+        frame = cv2.imread(filepath, cv2.IMREAD_COLOR)
         if frame is None:
             self._log_debug(f"CRITICAL: Failed to read image: {filepath}")
             try: os.remove(filepath)
@@ -670,31 +676,8 @@ class AttendanceWorker(multiprocessing.Process):
         db_operation_failed = False
         
         try:
-            # Resize image for faster CPU inference
-            max_dim = 640
-            h, w = frame.shape[:2]
-            if max(h, w) > max_dim:
-                scale = max_dim / max(h, w)
-                resized_frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
-            else:
-                resized_frame = frame
-                scale = 1.0
-
-            # Stage 2: Heavy Recognition (Using configured face detection backend, e.g. YOLOv8)
-            faces = self.face_handler.detect_faces(resized_frame)
-            
-            # [ROBUST FALLBACK] If no faces detected by primary backend, retry with InsightFace SCRFD
-            if len(faces) == 0:
-                if hasattr(self.face_handler, 'app') and self.face_handler.app is not None:
-                    faces = self.face_handler.app.get(frame)
-                    scale = 1.0
-            
-            # Scale coordinates back
-            if scale != 1.0:
-                for face in faces:
-                    face.bbox = face.bbox / scale
-                    if hasattr(face, 'kps') and face.kps is not None:
-                        face.kps = face.kps / scale
+            # Stage 2: Heavy Recognition (Using full-resolution frame directly — no redundant cv2.resize!)
+            faces = self.face_handler.detect_faces(frame)
             
             if len(faces) > 0:
                 # --- V5 PIPELINE: recognize_multiple_faces handles mask detection internally ---
@@ -742,13 +725,14 @@ class AttendanceWorker(multiprocessing.Process):
             return False
             
         # Clean up / delete the pending snapshot file on success
-        try:
-            os.remove(filepath)
-            from core.snapshot_manager import SnapshotPipelineManager
-            SnapshotPipelineManager().dispatched_files.discard(filepath)
-        except Exception as e:
-            self._log_debug(f"Failed to remove pending snapshot {filename}: {e}")
-            
+        for retry in range(3):
+            try:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+                break
+            except Exception as e:
+                time.sleep(0.02)
+                
         return True
 
     def handle_attendance(self, person, frame, capture_ts, event_type='in'):
