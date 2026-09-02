@@ -58,7 +58,13 @@ class APIClient:
                 "email": self.username,
                 "password": self.password
             }
-            response = requests.post(f"{self.base_url}/api/auth/login/", json=payload, timeout=10)
+            try:
+                response = requests.post(f"{self.base_url}/api/auth/login/", json=payload, timeout=10)
+            except requests.exceptions.SSLError:
+                logging.warning("SSL verification failed during login. Retrying with verify=False...")
+                import urllib3
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                response = requests.post(f"{self.base_url}/api/auth/login/", json=payload, timeout=10, verify=False)
             
             if response.status_code == 200:
                 data = response.json()
@@ -77,7 +83,7 @@ class APIClient:
                 time.sleep(1)
                 # Second attempt with more explicit headers
                 headers = self._get_headers()
-                response = requests.post(f"{self.base_url}/api/auth/login/", json=payload, headers=headers, timeout=10)
+                response = requests.post(f"{self.base_url}/api/auth/login/", json=payload, headers=headers, timeout=10, verify=False)
                 if response.status_code == 200:
                     data = response.json()
                     self.token = data.get('access_token')
@@ -111,12 +117,21 @@ class APIClient:
 
     def _api_request(self, method, endpoint, retry_on_401=True, **kwargs):
         """Centralized request handler with auto-token refresh on 401"""
+        if not self.token:
+            self.login()
+            
         url = f"{self.base_url}{endpoint}"
         if 'headers' not in kwargs:
             kwargs['headers'] = self._get_headers()
         
         try:
-            response = requests.request(method, url, **kwargs)
+            try:
+                response = requests.request(method, url, **kwargs)
+            except requests.exceptions.SSLError:
+                kwargs['verify'] = False
+                import urllib3
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                response = requests.request(method, url, **kwargs)
             
             if response.status_code == 401 and retry_on_401:
                 logging.info(f"401 Unauthorized for {endpoint}. Attempting token refresh...")
@@ -125,7 +140,7 @@ class APIClient:
                 if success:
                     # Update headers with new token and retry
                     kwargs['headers'] = self._get_headers()
-                    return requests.request(method, url, **kwargs)
+                    response = requests.request(method, url, **kwargs)
             
             return response
         except requests.exceptions.RequestException as e:
@@ -200,22 +215,20 @@ class APIClient:
     def get_today_attendance(self):
         """Get today's attendance records"""
         try:
-            today = date.today().isoformat()
-            response = self._api_request('GET', f"/api/attendance/?date={today}", timeout=10)
+            today_str = date.today().strftime('%d-%b-%Y')
+            response = self._api_request('GET', f"/api/android/report/attendance?FromDate={today_str}&ToDate={today_str}", timeout=10)
             
             if response.status_code == 200:
                 data = response.json()
                 logging.info(f"get_today_attendance success: {len(data)} records")
                 records = []
                 for item in data:
-                    # Map to format expected by CLI: (id, name, arrival, leaving, status)
-                    person = item.get('person', {})
                     records.append((
-                        item['person_id'],
-                        person.get('name', 'Unknown'),
-                        item['arrival_time'],
-                        item['leaving_time'],
-                        item['status']
+                        item.get('Person ID') or item.get('person_id'),
+                        item.get('Employee Name') or item.get('name', 'Unknown'),
+                        item.get('Check-In Time') or item.get('arrival_time'),
+                        item.get('Check-Out Time') or item.get('leaving_time'),
+                        item.get('Status') or item.get('status')
                     ))
                 return records
             logging.error(f"API Error (get_today_attendance): {response.status_code}")
@@ -284,14 +297,9 @@ class APIClient:
                 print(f"[DEBUG] APIClient: mark_attendance Success for {person_id} | event={event_type}")
                 return True, "Attendance Marked"
             elif resp.status_code == 403 and "Organization mismatch" in resp.text:
-                # Employee is detected locally at the logged-in organization.
-                # Try fallback by posting to /api/attendance/logs with current organization context
-                try:
-                    self.log_raw_detection(person_id, person_id, timestamp=timestamp, snapshot_path=snapshot_path, event_type=event_type)
-                except: pass
-                logging.info(f"mark_attendance: Multi-org employee {person_id} logged under current organization {getattr(self, 'user_org_name', 'active')}.")
-                print(f"[MULTI-ORG] Logged attendance for {person_id} under current active admin organization.")
-                return True, "Attendance Marked (Multi-Org Logged)"
+                logging.warning(f"[SECURITY] Employee {person_id} belongs to a different organization than logged-in admin ({getattr(self, 'user_org_name', 'active')}). Attendance rejected.")
+                print(f"[SECURITY] Employee {person_id} does not belong to active organization ({getattr(self, 'user_org_name', 'active')}). Ignored.")
+                return False, f"Organization mismatch: Employee does not belong to {getattr(self, 'user_org_name', 'current organization')}"
             else:
                 logging.error(f"mark_attendance API Error: {resp.status_code} - {resp.text}")
                 print(f"[DEBUG] APIClient: Error {resp.status_code} - {resp.text}")

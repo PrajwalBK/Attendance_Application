@@ -52,8 +52,8 @@ else:
     os.environ["NUMEXPR_NUM_THREADS"] = "2"
 os.environ["ORT_ARENA_EXTEND_STRATEGY"] = "kSameAsRequested"
 
-# AGGRESSIVE RTSP TIMEOUT: 5 seconds (in microseconds)
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|max_delay;500000|timeout;5000000|stimeout;5000000"
+# ZERO LATENCY RTSP: Disable all FFMPEG internal buffer queues for true real-time feeds
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;0|framedrop;1|timeout;5000000|stimeout;5000000"
 os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 
 import threading

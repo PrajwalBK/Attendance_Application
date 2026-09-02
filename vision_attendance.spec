@@ -29,7 +29,7 @@ except Exception:
 
 # Project folders and data dependencies (dynamically checked)
 added_datas = []
-for folder in ['models', 'data/models', 'data', 'config', 'core', 'ui', 'database', 'assets', 'icons']:
+for folder in ['models', 'data/models', 'data', 'config', 'core', 'ui', 'database', 'assets', 'icons', 'bin']:
     if os.path.exists(folder):
         added_datas.append((folder, folder))
 

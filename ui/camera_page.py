@@ -6,6 +6,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QAction
 import qtawesome as qta
 from ui.theme_manager import ThemeManager
+from ui.webrtc_qt_widget import WebRTCQtWidget
 
 
 class ROILabel(QLabel):
@@ -358,8 +359,6 @@ class CameraPage(QWidget):
             for i, widget in enumerate(self.cam_widgets):
                 frame = None
                 if self.backend.are_cameras_active:
-                    # Read directly from camera threads for smooth, real-time display
-                    # (bypasses the triage-bottlenecked latest_frames buffer)
                     if i < len(self.backend.caps) and self.backend.caps[i] is not None:
                         try:
                             ret, frame = self.backend.caps[i].read()
@@ -380,24 +379,7 @@ class CameraPage(QWidget):
                     widget.status_dot.setStyleSheet(f"color: {ThemeManager.COLORS['success']}; font-size: 9px;")
                     widget.time_lbl.setText(now.strftime('%H:%M:%S'))
 
-                    # Draw ROI overlay if configured (Bypassed)
                     display_frame = frame
-                    # if hasattr(self.backend, 'cam_rois') and i < len(self.backend.cam_rois):
-                    #     roi = self.backend.cam_rois[i]
-                    #     if roi != [0.0, 0.0, 1.0, 1.0]:
-                    #         fh, fw = display_frame.shape[:2]
-                    #         x1 = int(roi[0] * fw)
-                    #         y1 = int(roi[1] * fh)
-                    #         x2 = int(roi[2] * fw)
-                    #         y2 = int(roi[3] * fh)
-                    #         # Draw emerald green bounding box for the ROI active zone
-                    #         cv2.rectangle(display_frame, (x1, y1), (x2, y2), (76, 175, 80), 2)
-                    #         cv2.putText(display_frame, "ACTIVE ZONE", (x1 + 6, y1 + 18),
-                    #                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (76, 175, 80), 1, cv2.LINE_AA)
-
-                    # [PERFORMANCE] Resize in OpenCV first using fast INTER_NEAREST.
-                    # This avoids converting/scaling large images in Python/Qt,
-                    # reducing GUI thread CPU usage and GIL contention by 20x.
                     target_w = widget.video_label.width()
                     target_h = widget.video_label.height()
                     if target_w > 10 and target_h > 10:
@@ -409,31 +391,24 @@ class CameraPage(QWidget):
                         fh, fw = display_frame.shape[:2]
                         
                         def get_action_color(act):
-                            # (B, G, R) format
                             return (80, 175, 76) if act == "in" else ((80, 80, 244) if act == "out" else None)
                             
                         def draw_text_with_shadow(img, text, pos, scale, color):
-                            # Draw drop shadow outline in black
                             cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 2, cv2.LINE_AA)
-                            # Draw foreground text
                             cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
                             
-                        # Top (UP)
                         up_color = get_action_color(rules.get("up"))
                         if up_color:
                             draw_text_with_shadow(display_frame, f"UP: {rules['up'].upper()} ^", (fw // 2 - 40, 20), 0.4, up_color)
                                         
-                        # Bottom (DOWN)
                         down_color = get_action_color(rules.get("down"))
                         if down_color:
                             draw_text_with_shadow(display_frame, f"DOWN: {rules['down'].upper()} v", (fw // 2 - 45, fh - 10), 0.4, down_color)
                                         
-                        # Left (LEFT)
                         left_color = get_action_color(rules.get("left"))
                         if left_color:
                             draw_text_with_shadow(display_frame, f"< {rules['left'].upper()}", (10, fh // 2), 0.4, left_color)
                                         
-                        # Right (RIGHT)
                         right_color = get_action_color(rules.get("right"))
                         if right_color:
                             draw_text_with_shadow(display_frame, f"{rules['right'].upper()} >", (fw - 70, fh // 2), 0.4, right_color)

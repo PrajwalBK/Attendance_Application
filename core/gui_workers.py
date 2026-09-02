@@ -47,6 +47,13 @@ class BackendController(QThread):
         self.worker_signals = UIWorker()
         self.is_running = False
         self.stop_requested = False
+        
+        # Ensure go2rtc WebRTC server is pre-started
+        try:
+            from core.webrtc_service import webrtc_service
+            webrtc_service.start()
+        except Exception as e:
+            print(f"[WebRTC Service] Pre-start warning: {e}")
 
         # Load active count from config
         from config.cam_config_manager import CamConfigManager
@@ -540,6 +547,17 @@ class BackendController(QThread):
 
         if is_reachable:
             self.caps[i] = ThreadedCamera(final_src)
+            # Register with go2rtc WebRTC streaming engine
+            try:
+                from core.webrtc_service import webrtc_service
+                webrtc_service.start()
+                if isinstance(final_src, str) and ("rtsp://" in final_src or "http://" in final_src):
+                    import re
+                    clean_src = re.sub(r'([?&])timeout=\d+', '', str(final_src))
+                    if clean_src.endswith('?'): clean_src = clean_src[:-1]
+                    webrtc_service.add_stream(f"cam{i}", clean_src)
+            except Exception as e:
+                print(f"[WebRTC Service] Stream registration warning: {e}")
         else:
             self.caps[i] = None
             msg = f"Handshake Failed: {host}:{port}. Skipping to avoid 30s hang."
@@ -905,6 +923,10 @@ class BackendController(QThread):
                 except: pass
                     
                 self.caps[i] = None
+            try:
+                from core.webrtc_service import webrtc_service
+                webrtc_service.remove_stream(f"cam{i}")
+            except: pass
                 
         self.worker_signals.status_updated.emit("Cameras Offline")
 
@@ -1465,10 +1487,12 @@ class BackendController(QThread):
                                                 print(f"[BACKEND] Dispatching frames to recorder...")
                                         except: pass
                                         
-                                # Process active cameras for triage person detection & snapshot capture whenever cameras are active
+                                # Process active cameras for triage person detection & snapshot capture ONLY if role is not 'monitor'
                                 self.frame_counters[i] += 1
                                 if self.frame_counters[i] % self.process_every_n_frames == 0:
-                                    active_cams.append((i, frame, frame_id))
+                                    role = str(self.cam_roles[i]).lower() if i < len(self.cam_roles) else 'entrance'
+                                    if role != 'monitor':
+                                        active_cams.append((i, frame, frame_id))
 
                     # Run triage detections concurrently in the ThreadPoolExecutor (releases GIL)
                     triage_results = {}

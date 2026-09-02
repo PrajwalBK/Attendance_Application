@@ -1,5 +1,5 @@
 {
-    "rtsp_template": "rtsp://admin:Prosper%404321@{ip}:554/cam/realmonitor?channel={channel}&subtype=0",
+    "rtsp_template": "rtsp://admin:Prosper%404321@{ip}:554/cam/realmonitor?channel={channel}&subtype=1",
     "primary_source": "Channel 1",
     "secondary_source": "Channel 2",
     "num_channels": 16,
@@ -8,8 +8,8 @@
     "cams": [
         {
             "name": "CAMERA 1",
-            "source": "Camera 8",
-            "role": "entrance",
+            "source": "Camera 1",
+            "role": "monitor",
             "ip": "192.168.1.240",
             "roi": [
                 0.0,
@@ -18,8 +18,8 @@
                 1.0
             ],
             "direction_rules": {
-                "up": "ignore",
-                "down": "ignore",
+                "up": "out",
+                "down": "in",
                 "left": "ignore",
                 "right": "ignore"
             }
@@ -27,7 +27,7 @@
         {
             "name": "CAMERA 2",
             "source": "Camera 6",
-            "role": "exit",
+            "role": "monitor",
             "ip": "192.168.1.240",
             "roi": [
                 0.0,
@@ -36,8 +36,8 @@
                 1.0
             ],
             "direction_rules": {
-                "up": "ignore",
-                "down": "ignore",
+                "up": "out",
+                "down": "in",
                 "left": "ignore",
                 "right": "ignore"
             }

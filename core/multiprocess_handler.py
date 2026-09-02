@@ -67,6 +67,16 @@ class AttendanceWorker(multiprocessing.Process):
 
 
     def run(self):
+        try:
+            import psutil
+            p = psutil.Process()
+            if hasattr(psutil, 'BELOW_NORMAL_PRIORITY_CLASS'):
+                p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+            elif hasattr(os, 'nice'):
+                os.nice(5)
+        except Exception:
+            pass
+
         self._log_debug("Initializing (Forensic Mode)...")
         try:
             from core.face_recognition import FaceRecognitionHandler

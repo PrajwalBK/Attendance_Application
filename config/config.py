@@ -51,7 +51,7 @@ DNN_MODEL_PATH = os.path.join(MODELS_DIR, "res10_300x300_ssd_iter_140000.caffemo
 DNN_CONFIDENCE_THRESHOLD = 0.30
 
 # Video Processor Defaults
-PROCESS_EVERY_N_FRAMES = 1
+PROCESS_EVERY_N_FRAMES = 3
 ATTENDANCE_COOLDOWN_SECONDS = 300  # 5 Minutes per person
 
 # RTSP Stream Reconnection Settings

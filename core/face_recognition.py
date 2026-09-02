@@ -500,14 +500,11 @@ class FaceRecognitionHandler:
                 def bg_sync():
                     try:
                         db_encodings = self.db_manager.get_all_face_encodings()
-                        if db_encodings:
-                            # Update in-memory registered faces
-                            self.registered_faces.update(db_encodings)
-                            # Remove deleted faces
-                            for key in list(self.registered_faces.keys()):
-                                if key not in db_encodings:
-                                    del self.registered_faces[key]
-                            print(f"[DB BACKGROUND] Successfully synced {len(db_encodings)} faces from server.")
+                        if db_encodings is not None:
+                            # Strict overwrite with only active organization encodings
+                            self.registered_faces = db_encodings.copy()
+                            self._rebuild_encoding_matrix()
+                            print(f"[DB BACKGROUND] Successfully synced {len(db_encodings)} faces for active organization.")
                             # Update local cache
                             try:
                                 with open(FACE_ENCODINGS_PATH, 'wb') as f:

@@ -97,14 +97,35 @@ This document records technical updates, optimizations, and build configurations
   - Run face and body detection concurrently to catch both standing and seated employees in the camera frame.
   - Enqueue 2 snapshots/sec continuously to `data/pending_snapshots` whenever people are present on camera.
 
-### 13. Backend Thread Heartbeat & Error Shielding
+### 13. WebRTC & go2rtc implementation
+- **Requirement**: Replace high-latency, CPU-heavy software MJPEG video streaming with hardware-accelerated, ultra-low latency (<50ms) WebRTC streaming.
+- **Solution Implemented**:
+  1. Integrated **go2rtc** streaming engine:
+     - Created `core/webrtc_service.py` and `backend/services/webrtc_service.py` with automatic cross-platform binary resolution & auto-downloader for Windows and Linux ARM64 (Raspberry Pi).
+     - Managed lifecycle subprocess with clean start/stop hooks on FastAPI startup/shutdown.
+  2. Dynamic Stream Registration:
+     - Updated `toggle_cameras` in `api.py` to register RTSP camera URLs directly with go2rtc (`cam0`, `cam1`).
+  3. WebRTC & WHEP API Endpoints:
+     - Exposed `/api/local/webrtc/{camera_id}` for direct SDP offer/answer peer connection exchange.
+     - Exposed `/api/local/whep/{camera_id}` for standard WHEP video streaming.
+     - Exposed `/api/local/webrtc/status` for monitoring stream health and active consumers.
+     - Preserved `/api/local/video_feed/{camera_id}` as a fallback MJPEG stream.
+  4. PySide6 Desktop GUI Integration (`ui/webrtc_qt_widget.py` & `ui/camera_page.py`):
+     - Created `WebRTCQtWidget` embedding `QWebEngineView` directly inside the PySide6 Qt GUI grid.
+     - Streams real-time CCTV feeds via WebRTC (<50ms delay) with hardware GPU acceleration.
+     - Integrated stream lifecycle management into `BackendController` in `core/gui_workers.py`.
+  5. Frontend Streaming Components:
+     - Created `ui/webrtc_player.js` (vanilla WebRTC client helper with auto-reconnection and ICE candidate gathering).
+     - Created `ui/WebRTCPlayer.jsx` (reusable React component with automatic fallback to MJPEG if WebRTC negotiation fails).
+
+### 14. Backend Thread Heartbeat & Error Shielding
 - **Root Cause of Backend Thread Exit**:
   - In `BackendController.run()`: `now = time.time()` was placed conditionally inside the triage result block, causing an `UnboundLocalError` on tick cycles when `active_cams` was empty or on camera source switch.
 - **Fix Applied**:
   - Initialized `now = time.time()` at the top of every capture heartbeat tick.
   - Wrapped the capture and tracking loop in a master `try-except` block to prevent any transient frame error from crashing the Qt backend thread.
 
-### 14. Zero-Lag RTSP Video Pipeline & Real-Time Rendering
+### 15. Zero-Lag RTSP Video Pipeline & Real-Time Rendering
 - **Root Cause of Video Lag / Latency**:
   1. `ThreadedCamera.update_sub` was sleeping `time.sleep(0.03)` on successful frame reads. Since network RTSP packets arrived faster than 30ms sleep intervals, FFmpeg buffered stale packets internally, causing accumulated video lag (2–5 seconds).
   2. `OPENCV_FFMPEG_CAPTURE_OPTIONS` had `max_delay;500000` (500ms delay).

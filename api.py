@@ -19,11 +19,26 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from config.config import get_config
 from core.camera import ThreadedCamera
 from config.cam_config_manager import CamConfigManager
+from core.webrtc_service import webrtc_service
 
 # Pre-load heavy modules in the main thread to avoid ImportLock deadlocks in background threads
 import core.face_recognition
 
 app = FastAPI(title="Vision Attendance Local API")
+
+@app.on_event("startup")
+async def on_startup():
+    try:
+        webrtc_service.start()
+    except Exception as e:
+        print(f"[WebRTC] Startup warning: {e}")
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    try:
+        webrtc_service.stop()
+    except Exception as e:
+        print(f"[WebRTC] Shutdown warning: {e}")
 
 # Allow CORS for local React dev server
 app.add_middleware(
@@ -282,11 +297,17 @@ async def toggle_cameras(req: CameraToggleReq):
         if src1 is not None:
             print(f"Opening Cam 1: {src1}")
             state.caps[0] = ThreadedCamera(src1)
+            # Register with go2rtc WebRTC engine
+            if isinstance(src1, str) and src1.startswith("rtsp://"):
+                webrtc_service.add_stream("cam0", src1)
             
         src2 = _parse_source(req.cam2_source)
         if src2 is not None:
              print(f"Opening Cam 2: {src2}")
              state.caps[1] = ThreadedCamera(src2)
+             # Register with go2rtc WebRTC engine
+             if isinstance(src2, str) and src2.startswith("rtsp://"):
+                 webrtc_service.add_stream("cam1", src2)
              
         state.are_cameras_active = any(c is not None for c in state.caps)
         return {"status": "success", "message": "Cameras starting."}
@@ -297,10 +318,80 @@ async def toggle_cameras(req: CameraToggleReq):
              if state.caps[i]:
                  state.caps[i].release()
                  state.caps[i] = None
+             webrtc_service.remove_stream(f"cam{i}")
         return {"status": "success", "message": "Cameras stopped."}
 
+# --- WebRTC Endpoints (Powered by go2rtc) ---
+
+@app.post("/api/local/webrtc/{camera_id}")
+async def webrtc_negotiate(camera_id: int, request: Request):
+    """
+    Direct WebRTC SDP offer/answer exchange endpoint for zero-latency camera viewing.
+    Accepts raw SDP offer text or JSON { "sdp": "..." } from WebRTC client.
+    Returns SDP answer text or JSON { "sdp": "...", "type": "answer" }.
+    """
+    if camera_id not in [0, 1]:
+        return Response(status_code=400, content="Invalid camera ID. Must be 0 or 1.")
+        
+    stream_name = f"cam{camera_id}"
+    
+    # Extract SDP offer from request body
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+            offer_sdp = body.get("sdp", "")
+        except Exception:
+            offer_sdp = ""
+    else:
+        body_bytes = await request.body()
+        offer_sdp = body_bytes.decode("utf-8")
+        
+    if not offer_sdp:
+        return Response(status_code=400, content="Missing SDP offer in request body")
+        
+    # Attempt WebRTC SDP exchange
+    answer_sdp = webrtc_service.exchange_webrtc_sdp(stream_name, offer_sdp)
+    if not answer_sdp:
+        answer_sdp = webrtc_service.exchange_whep_sdp(stream_name, offer_sdp)
+        
+    if not answer_sdp:
+        return Response(
+            status_code=502,
+            content=f"Failed to negotiate WebRTC stream for camera {camera_id}. Ensure camera is active."
+        )
+        
+    if "application/json" in content_type:
+        return {"sdp": answer_sdp, "type": "answer"}
+    return Response(content=answer_sdp, media_type="application/sdp")
+
+@app.post("/api/local/whep/{camera_id}")
+async def whep_stream(camera_id: int, request: Request):
+    """Standard WHEP (WebRTC HTTP Egress Protocol) endpoint."""
+    if camera_id not in [0, 1]:
+        return Response(status_code=400, content="Invalid camera ID")
+        
+    stream_name = f"cam{camera_id}"
+    body_bytes = await request.body()
+    offer_sdp = body_bytes.decode("utf-8")
+    
+    answer_sdp = webrtc_service.exchange_whep_sdp(stream_name, offer_sdp)
+    if not answer_sdp:
+        return Response(status_code=502, content="WHEP negotiation failed")
+    return Response(content=answer_sdp, media_type="application/sdp")
+
+@app.get("/api/local/webrtc/status")
+async def webrtc_status():
+    """Returns go2rtc WebRTC engine health and active streams."""
+    return {
+        "is_running": webrtc_service.is_running(),
+        "streams": webrtc_service.get_streams_status()
+    }
+
+# --- Fallback MJPEG Stream ---
+
 def generate_frames(cam_index: int):
-    """Generator for MJPEG stream formatting."""
+    """Generator for MJPEG stream formatting (fallback for non-WebRTC clients)."""
     while True:
         if not state.are_cameras_active:
             time.sleep(1)
@@ -312,12 +403,9 @@ def generate_frames(cam_index: int):
                  frame = state.latest_frames[cam_index].copy()
                  
         if frame is None:
-            # Yield a blank placeholder image or simply wait
             time.sleep(0.1)
             continue
             
-        # Optional: Add simple timestamp or info on the frame
-        
         _, buffer = cv2.imencode('.jpg', frame)
         frame_bytes = buffer.tobytes()
         
